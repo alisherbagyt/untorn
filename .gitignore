@@ -1,0 +1,53 @@
+# Git
+.git
+.gitignore
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.Python
+*.pyc
+.pytest_cache/
+.coverage
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Frontend build and cache
+frontend/.next/
+frontend/out/
+frontend/node_modules/
+frontend/.vercel/
+frontend/dist/
+frontend/build/
+
+# Backend
+backend/__pycache__/
+backend/.venv/
+backend/venv/
+
+# Project
+.claude/
+data/
+lama/
+sam2/
+
+# OS
+Thumbs.db
+.DS_Store

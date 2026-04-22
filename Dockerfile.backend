@@ -1,0 +1,30 @@
+FROM pytorch/pytorch:2.5.1-cuda12.1-cudnn9-runtime
+
+WORKDIR /app
+
+# System libs required by OpenCV, SAM2, and image processing
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git libglib2.0-0 libgl1 libsm6 libxext6 libxrender1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install SAM2 from local copy (editable so configs resolve correctly)
+COPY sam2/ sam2/
+RUN pip install --no-cache-dir --no-build-isolation -e sam2/
+
+# Install web API dependencies
+COPY requirements_web.txt .
+RUN pip install --no-cache-dir -r requirements_web.txt
+
+# Copy application code and pipeline
+COPY backend/ backend/
+COPY untorn/ untorn/
+COPY lama/ lama/
+COPY run.py .
+
+# Ensure data directories exist (real data is mounted as a volume)
+RUN mkdir -p data/input data/output data/debug
+
+ENV PYTHONPATH=/app
+
+EXPOSE 8000
+CMD ["python", "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]

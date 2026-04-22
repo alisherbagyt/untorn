@@ -1,0 +1,37 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      # Model weights are mounted read-only so they don't need to be in the image.
+      # Make sure these files exist on the host before running.
+      - ./sam2/sam2.1_hiera_small.pt:/app/sam2/sam2.1_hiera_small.pt:ro
+      - ./lama/big-lama:/app/lama/big-lama:ro
+    environment:
+      - TORCH_DEVICE=cuda
+      - LAMA_JIT_PATH=/app/lama/big-lama/big-lama.pt
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    ports:
+      - "3000:3000"
+    environment:
+      # Points to the backend service by its Docker Compose service name
+      - BACKEND_URL=http://backend:8000
+    depends_on:
+      - backend
+    restart: unless-stopped

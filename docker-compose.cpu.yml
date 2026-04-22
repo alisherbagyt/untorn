@@ -1,0 +1,10 @@
+# CPU-only override — use when the machine has no NVIDIA GPU.
+# Run with:
+#   docker compose -f docker-compose.yml -f docker-compose.cpu.yml up --build -d
+#
+# Warning: SAM2 on CPU is 10-50x slower than on GPU.
+services:
+  backend:
+    environment:
+      - TORCH_DEVICE=cpu
+    deploy: {}
