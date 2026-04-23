@@ -44,11 +44,68 @@ from scipy.spatial import cKDTree
 
 from . import config as cfg
 from .contours import compute_curvature_string
+from .appearance import seam_patch_cosine
+from .text_lines import text_line_continuity
 
 
 # Toggle verbose per-edge-pair rejection tracing with
 #   set UNTORN_MATCH_TRACE=1   (Windows)
 _MATCH_TRACE = bool(os.environ.get("UNTORN_MATCH_TRACE"))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Paper-color fingerprint (for the gate-D paper-LAB prefilter/score)
+# ══════════════════════════════════════════════════════════════════════════
+
+def _mean_paper_lab(image_rgb: np.ndarray,
+                    frag: dict,
+                    erode_px: int = 5,
+                    ink_grayscale_max: int = 140) -> np.ndarray | None:
+    """
+    Median LAB of paper-only pixels inside a fragment:
+      inside the mask, away from the boundary, and *not* ink.
+    Returns (3,) float32 or None if no paper pixels could be isolated.
+    """
+    mask = frag.get("mask")
+    if mask is None:
+        return None
+    k = max(1, int(erode_px))
+    kernel = np.ones((2 * k + 1, 2 * k + 1), np.uint8)
+    interior = cv2.erode((mask > 127).astype(np.uint8), kernel)
+    if interior.sum() < 16:
+        interior = (mask > 127).astype(np.uint8)
+    gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+    paper_mask = (interior > 0) & (gray >= ink_grayscale_max)
+    if paper_mask.sum() < 16:
+        paper_mask = interior > 0
+    lab = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    pts = lab[paper_mask]
+    if pts.size == 0:
+        return None
+    return np.median(pts, axis=0).astype(np.float32)
+
+
+def attach_paper_lab_all(fragments: list[dict], image_rgb: np.ndarray) -> None:
+    """Cache a per-fragment paper-color LAB fingerprint on frag['paper_lab']."""
+    for frag in fragments:
+        frag["paper_lab"] = _mean_paper_lab(image_rgb, frag)
+
+
+def _paper_lab_delta(frag_a: dict, frag_b: dict) -> float:
+    """LAB ΔE76 between two fragments' paper fingerprints. inf if missing."""
+    la = frag_a.get("paper_lab")
+    lb = frag_b.get("paper_lab")
+    if la is None or lb is None:
+        return float("inf")
+    return float(np.linalg.norm(np.asarray(la) - np.asarray(lb)))
+
+
+def _paper_color_score(frag_a: dict, frag_b: dict) -> float:
+    """Map the LAB ΔE into a [0, 1] compatibility score (1 = identical)."""
+    d = _paper_lab_delta(frag_a, frag_b)
+    if not np.isfinite(d):
+        return 0.5   # neutral when we can't measure
+    return float(max(0.0, 1.0 - d / max(cfg.MATCH_PAPER_COLOR_DELTA_MAX, 1e-6)))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -616,12 +673,18 @@ def evaluate_edge_fit(frag_a: dict, frag_b: dict,
 #  Per-fragment pre-computation (edges, curvature, SDT)
 # ══════════════════════════════════════════════════════════════════════════
 
-def prepare_edges_and_sdt(fragments: list[dict]) -> None:
+def prepare_edges_and_sdt(fragments: list[dict],
+                          image_rgb: np.ndarray | None = None) -> None:
     """
     Populate frag["edges"] with torn/factory classification, attach a
     per-edge curvature string, and cache the interior signed-distance
     transform for each fragment (used by the physical gate).
+
+    If `image_rgb` is provided we also cache a per-fragment paper-LAB
+    fingerprint (see `_mean_paper_lab`) for the matching paper-color gate.
     """
+    if image_rgb is not None:
+        attach_paper_lab_all(fragments, image_rgb)
     for frag in fragments:
         # Prefer the sub-pixel contour (from boundary.refine_boundary_subpixel)
         # when available; the integer contour is kept only as a fallback and
@@ -735,12 +798,41 @@ def _match_edge_pair(edge_a: dict, edge_b: dict,
     if len(matched_a) < 3:
         _trace("few_matched_pts"); return None
 
-    # Procrustes: map B → A
-    angle0, t0, rms0, R0 = procrustes_rigid(matched_b, matched_a)
+    # Multi-seed Procrustes: SW may have picked a wrong sub-arc, so we fit
+    # from several overlapping windows into the matched correspondences and
+    # keep the seed with the lowest RMS. This defeats the "locked to wrong
+    # rotation because SW latched onto the wrong end" local minimum that
+    # single-start Procrustes falls into under edge noise.
+    N = len(matched_a)
+    n_seeds = max(1, int(cfg.MATCH_PROCRUSTES_SEEDS))
+    if N < 4 or n_seeds <= 1:
+        seed_windows = [(0, N)]
+    else:
+        # Overlapping sliding windows of ~2/3 N. Equivalent to the full arc
+        # when n_seeds == 1 and to {head, centre, tail} for n_seeds == 3.
+        win = max(3, (2 * N + n_seeds) // (n_seeds + 1))
+        starts = np.linspace(0, max(0, N - win), n_seeds).astype(int)
+        seed_windows = [(int(s), int(min(N, s + win))) for s in starts]
+        seed_windows.append((0, N))   # always include the full arc as backup
+
+    best_seed = None   # (rms, angle, t, R, window)
+    for (ws, we) in seed_windows:
+        if we - ws < 3:
+            continue
+        ang_s, t_s, rms_s, R_s = procrustes_rigid(
+            matched_b[ws:we], matched_a[ws:we])
+        if not np.isfinite(rms_s):
+            continue
+        if abs(np.degrees(ang_s)) > cfg.RECON_MAX_ROTATION_DEG:
+            continue
+        if best_seed is None or rms_s < best_seed[0]:
+            best_seed = (rms_s, ang_s, t_s, R_s, (ws, we))
+
+    if best_seed is None:
+        _trace("procrustes_no_seed"); return None
+    rms0, angle0, t0, R0, seed_win = best_seed
     if rms0 > cfg.MATCH_MAX_RMS:
         _trace("rms_high", rms=f"{rms0:.2f}"); return None
-    if abs(np.degrees(angle0)) > cfg.RECON_MAX_ROTATION_DEG:
-        _trace("rotation_large", ang=f"{np.degrees(angle0):.1f}"); return None
 
     # ── Two-phase ICP jitter correction on full edge point sets ─────
     # We refine against the full edge-point polyline of A (not just the SW
@@ -770,7 +862,12 @@ def _match_edge_pair(edge_a: dict, edge_b: dict,
     # (higher rms) OR if it rotated far away from the initial estimate.
     angle_icp = float(np.arctan2(R[1, 0], R[0, 0]))
     drift_deg = abs(np.degrees(angle_icp - angle0))
-    if rms > rms0 + 0.5 or drift_deg > cfg.ICP_MAX_DRIFT_DEG:
+    # Relaxed drift cap: with multi-seed Procrustes the initial pose is much
+    # less likely to be wildly off, so we can afford ICP to move further
+    # looking for the real basin. The SDT physical gate downstream catches
+    # the rare case where ICP rotates into an interpenetrating minimum.
+    drift_cap = max(cfg.ICP_MAX_DRIFT_DEG, cfg.MATCH_ICP_DRIFT_DEG)
+    if rms > rms0 + 0.5 or drift_deg > drift_cap:
         R, t, rms = R0, t0, rms0
     angle = float(np.arctan2(R[1, 0], R[0, 0]))
 
@@ -806,8 +903,110 @@ def _match_edge_pair(edge_a: dict, edge_b: dict,
     w_app = cfg.MATCH_APPEARANCE_WEIGHT
     stotal = sarea + slen + scorr + w_app * sappearance  # in [0, 3+w_app]
 
-    # Normalized confidence in [0, 1]
-    conf = max(0.0, min(1.0, 1.0 - stotal / cfg.CONFIDENCE_STOTAL_SPAN))
+    # Legacy geometry-only confidence (kept for trace/diagnostics).
+    geom_conf = max(0.0, min(1.0, 1.0 - stotal / cfg.CONFIDENCE_STOTAL_SPAN))
+
+    # ── Gate C: DINOv2 seam appearance ────────────────────────────────────
+    # Sample a few patches on each side of the proposed seam in canvas space
+    # and cosine-compare the feature vectors. The caller only populates
+    # frag["dinov2"] when the DINOv2 extractor has been run earlier in the
+    # pipeline; otherwise we neutralise the gate.
+    dinov2_score = 0.5
+    dinov2_n     = 0
+    if (frag_a is not None and frag_b is not None and
+            frag_a.get("dinov2") is not None and frag_b.get("dinov2") is not None):
+        M_ba = affine_from_Rt(R, t)           # B -> A's frame
+        I    = np.eye(3, dtype=np.float64)    # A stays in its own frame
+        seam_mid = 0.5 * (matched_a[len(matched_a) // 2] +
+                          affine_apply(M_ba, matched_b[len(matched_b) // 2:
+                                                       len(matched_b) // 2 + 1])[0])
+        # Normal along the seam: perpendicular to local arc tangent.
+        if len(matched_a) >= 2:
+            tgt = matched_a[-1] - matched_a[0]
+            tgt_n = np.linalg.norm(tgt)
+            if tgt_n > 1e-6:
+                tgt = tgt / tgt_n
+                seam_normal = np.array([-tgt[1], tgt[0]], dtype=np.float64)
+            else:
+                seam_normal = np.array([1.0, 0.0])
+        else:
+            seam_normal = np.array([1.0, 0.0])
+        # Point normal from A's side to B's side: the seam separates A's
+        # interior from B's; after pose, B's centroid - A's centroid in A's
+        # frame tells us which way is "toward B".
+        try:
+            b_cen_in_a = affine_apply(M_ba, np.asarray(frag_b["centroid"])
+                                               .reshape(1, 2))[0]
+            a_cen      = np.asarray(frag_a["centroid"], dtype=np.float64)
+            toward_b   = b_cen_in_a - a_cen
+            if np.dot(seam_normal, toward_b) < 0:
+                seam_normal = -seam_normal
+        except Exception:
+            pass
+        dinov2_score, dinov2_n = seam_patch_cosine(
+            frag_a, frag_b, I, M_ba, seam_mid, seam_normal)
+        if dinov2_n >= 2 and dinov2_score < cfg.MATCH_APPEARANCE_COS_MIN:
+            _trace("dinov2_low", cos=f"{dinov2_score:.2f}")
+            return None
+
+    # ── Gate D: text-line continuity ──────────────────────────────────────
+    text_score = 0.0
+    text_expected = 0
+    if (frag_a is not None and frag_b is not None and
+            frag_a.get("text_lines") is not None and
+            frag_b.get("text_lines") is not None):
+        M_ba = affine_from_Rt(R, t)
+        I    = np.eye(3, dtype=np.float64)
+        # Seam centre in A's frame (reuse matched midpoint).
+        seam_mid = matched_a[len(matched_a) // 2]
+        tgt = matched_a[-1] - matched_a[0]
+        tgt_n = np.linalg.norm(tgt)
+        if tgt_n > 1e-6:
+            tgt = tgt / tgt_n
+            seam_normal = np.array([-tgt[1], tgt[0]], dtype=np.float64)
+        else:
+            seam_normal = np.array([1.0, 0.0])
+        text_score, text_expected = text_line_continuity(
+            frag_a["text_lines"], frag_b["text_lines"], I, M_ba,
+            seam_mid, seam_normal,
+            max_y_disc_px=cfg.TEXT_LINE_MAX_Y_DISC_PX,
+            max_angle_disc_deg=cfg.TEXT_LINE_MAX_ANGLE_DISC_DEG,
+            search_radius_px=cfg.TEXT_LINE_SEAM_RADIUS_PX)
+        if (text_expected >= cfg.MATCH_TEXT_LINE_MIN_EXPECT and
+                text_score < cfg.MATCH_TEXT_LINE_MIN_CONT):
+            _trace("text_discontinuity",
+                   score=f"{text_score:.2f}", expected=text_expected)
+            return None
+
+    # ── Paper-color similarity (soft score, no hard gate here) ────────────
+    paper_score = _paper_color_score(frag_a, frag_b) \
+        if (frag_a is not None and frag_b is not None) else 0.5
+
+    # ── Combined confidence — weighted, bounded [0, 1] ────────────────────
+    # Each sub-score is already in [0, 1]:
+    #   geom_conf     : lower stotal -> higher value
+    #   dinov2_score  : 0.5 * (cos + 1) in [0, 1]
+    #   strip_ncc     : 1 - sappearance (sappearance is a cost in [0, 1])
+    #   text_score    : n_continued / n_expected in [0, 1]
+    #   paper_score   : 1 - ΔE/ΔE_max
+    strip_ncc_score = float(max(0.0, 1.0 - sappearance))
+    # Text-line weight shifts onto geometry when the pair has no text signal
+    # (otherwise fragments with no writing near the seam would always be
+    # penalised). Expected == 0 means the gate didn't apply.
+    w_geom = cfg.CONF_W_GEOMETRY
+    w_app_ = cfg.CONF_W_APPEARANCE
+    w_str  = cfg.CONF_W_STRIP_NCC
+    w_txt  = cfg.CONF_W_TEXT_LINE
+    w_pap  = cfg.CONF_W_PAPER_COLOR
+    if text_expected < cfg.MATCH_TEXT_LINE_MIN_EXPECT:
+        w_geom += w_txt
+        w_txt = 0.0
+    conf = (w_geom * geom_conf +
+            w_app_ * dinov2_score +
+            w_str  * strip_ncc_score +
+            w_txt  * text_score +
+            w_pap  * paper_score)
+    conf = float(max(0.0, min(1.0, conf)))
 
     result = {
         "orientation": orientation,
@@ -823,6 +1022,13 @@ def _match_edge_pair(edge_a: dict, edge_b: dict,
         "scorr":       float(scorr),
         "sappearance": float(sappearance),
         "stotal":      float(stotal),
+        "geom_conf":   float(geom_conf),
+        "dinov2_score": float(dinov2_score),
+        "dinov2_n":    int(dinov2_n),
+        "strip_ncc_score": float(strip_ncc_score),
+        "text_score":  float(text_score),
+        "text_expected": int(text_expected),
+        "paper_score": float(paper_score),
         "confidence":  float(conf),
         "matched_a":   np.asarray(matched_a, dtype=np.float64),
         "matched_b":   np.asarray(matched_b, dtype=np.float64),

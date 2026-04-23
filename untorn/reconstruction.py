@@ -1186,8 +1186,20 @@ def reconstruct(fragments: list[dict],
     # ── Edge extraction + SDT pre-compute ─────────────────────────────
     print("  -- Preparing edges + interior SDTs --")
     t0 = time.time()
-    M.prepare_edges_and_sdt(fragments)
+    M.prepare_edges_and_sdt(fragments, image_rgb=image_rgb)
     print(f"     done ({time.time()-t0:.2f}s)")
+
+    # ── DINOv2 dense features (Gate C of the new matcher) ──────────────
+    # Loads the ViT-S/14 extractor, caches per-fragment patch tokens, then
+    # leaves the model resident. It is released at the end of this function
+    # so downstream LaMa can claim the VRAM back.
+    from . import config as _cfg
+    if _cfg.DINOV2_ENABLED:
+        print("  -- Extracting DINOv2 dense features --")
+        t0 = time.time()
+        from .appearance import attach_dinov2_features_all
+        attach_dinov2_features_all(fragments, image_rgb)
+        print(f"     done ({time.time()-t0:.2f}s)")
 
     # ── Identify corners ──────────────────────────────────────────────
     corners = identify_corners(fragments)
@@ -1403,6 +1415,16 @@ def reconstruct(fragments: list[dict],
     print(f"\n  Reconstruction complete: {len(placed)}/{n} placed, "
           f"{len(merge_log)} merges, "
           f"match cache {cache.n_calls} calls / {cache.n_hits} hits")
+
+    # Release DINOv2 VRAM so the LaMa inpainter can claim it back.
+    try:
+        from .appearance import DINOv2Extractor
+        DINOv2Extractor.release()
+    except Exception:
+        pass
+    for f in fragments:
+        f.pop("dinov2", None)
+
     return transforms
 
 

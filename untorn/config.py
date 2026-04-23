@@ -113,6 +113,28 @@ DINOV2_DEVICE              = "cuda"            # falls back to CPU if unavailabl
 DINOV2_SEAM_N_PATCHES      = 8                 # samples per side of the seam
 DINOV2_SEAM_PATCH_OFFSET_PX = 10.0             # how far from seam to sample
 
+# ─── Matching gates (layout-agnostic, 4-cascade) ────────────────────────────
+# The overhauled matcher runs four cascaded gates per candidate edge pair.
+# (A) SW curvature pre-filter, (B) Procrustes + ICP + SDT geometry, (C)
+# DINOv2 + strip-NCC appearance, (D) text-line continuity. Confidence is
+# a weighted sum of the gate scores. Weights must sum close to 1.0 so the
+# score stays interpretable in [0, 1].
+
+MATCH_ICP_DRIFT_DEG        = 15.0    # relaxed from 5 deg; multi-seed Procrustes
+                                     # + SDT gate catches bad basins instead.
+MATCH_PROCRUSTES_SEEDS     = 3       # try start/middle/end sub-arc windows
+MATCH_APPEARANCE_COS_MIN   = 0.55    # DINOv2 seam cosine floor (gate C)
+MATCH_TEXT_LINE_MIN_CONT   = 0.30    # text-line continuity floor (gate D)
+MATCH_TEXT_LINE_MIN_EXPECT = 2       # below this "expected" count, skip gate D
+MATCH_PAPER_COLOR_DELTA_MAX = 12.0   # LAB ΔE prefilter between fragments
+
+# Confidence weights (sum should be ~1.0)
+CONF_W_GEOMETRY    = 0.30    # (1 - stotal / CONFIDENCE_STOTAL_SPAN)
+CONF_W_APPEARANCE  = 0.20    # DINOv2 seam cosine, mapped to [0, 1]
+CONF_W_STRIP_NCC   = 0.20    # existing 8-px strip NCC
+CONF_W_TEXT_LINE   = 0.20    # text-line continuity (0 when not applicable)
+CONF_W_PAPER_COLOR = 0.10    # 1 - LAB ΔE / MATCH_PAPER_COLOR_DELTA_MAX
+
 # ─── Reconstruction parameters ─────────────────────────────────────────────
 
 # Contour / support points
