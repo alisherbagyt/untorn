@@ -70,6 +70,49 @@ HOLE_CONTAINMENT_THRESH = 0.85
 
 MAX_FRAGMENTS = 40   # raised from 20 — Image 1 has ~30 fragments
 
+# ─── Text-line detection ──────────────────────────────────────────────────
+# Per-fragment baseline detection uses a rotation sweep + projection
+# profile peak-finder on the ink-only mask. Baselines feed two things
+# downstream: (a) a matching gate that rewards text continuity across a
+# proposed seam, and (b) a global rotation prior so the assembled cluster
+# ends up with horizontal text.
+
+TEXT_LINE_ANGLE_SEARCH_DEG = 30.0    # +- angular search window for baseline tilt
+TEXT_LINE_ANGLE_STEP_DEG   = 2.0     # angular step during sweep
+TEXT_LINE_MIN_INK_FRAC     = 0.02    # row must have >=2% ink pixels to be a peak
+TEXT_LINE_INK_GRAYSCALE_MAX = 140    # pixels darker than this count as ink
+TEXT_LINE_MAX_Y_DISC_PX    = 3.0     # vertical discontinuity cap (continuity gate)
+TEXT_LINE_MAX_ANGLE_DISC_DEG = 8.0   # angular discontinuity cap
+TEXT_LINE_SEAM_RADIUS_PX   = 20.0    # how close a line must run to the seam
+
+# ─── Sub-pixel boundary refinement ─────────────────────────────────────────
+# SAM 2.1 masks are integer-pixel, so raw boundary points have +-1 px
+# jitter that dominates curvature for gentle tears. We snap each boundary
+# point to the local gradient-magnitude maximum along its inward normal,
+# within a small band. Gives genuinely sub-pixel contours.
+
+BOUNDARY_REFINE_ENABLED    = True
+BOUNDARY_GRADIENT_BAND_PX  = 5       # search +-this many px along normal
+BOUNDARY_SMOOTH_SIGMA      = 1.0     # Gaussian smoothing on image before gradient
+BOUNDARY_STEP_PX           = 0.5     # sub-pixel sampling step along normal
+
+# ─── DINOv2 dense-feature appearance gate ──────────────────────────────────
+# Small Vision Transformer (ViT-S/14, ~22M params, ~84 MB checkpoint, ~0.8 GB
+# VRAM when active) used purely as a frozen feature extractor. For every
+# fragment we cache a (H_p, W_p, D) dense patch-token map over its bbox
+# crop; for every proposed seam we sample a few patches on each side of the
+# seam in canvas space, map them back into the two fragments' crops, and
+# cosine-similarity the feature vectors. Same paper + same ink regime →
+# cosine ~0.7+; different paper / different fragment source → ~0.3.
+
+DINOV2_ENABLED             = True
+DINOV2_MODEL               = "dinov2_vits14"   # ~90 MB when loaded
+DINOV2_PATCH_SIZE          = 14
+DINOV2_INPUT_SIZE          = 224               # 16 x 16 token grid
+DINOV2_DEVICE              = "cuda"            # falls back to CPU if unavailable
+DINOV2_SEAM_N_PATCHES      = 8                 # samples per side of the seam
+DINOV2_SEAM_PATCH_OFFSET_PX = 10.0             # how far from seam to sample
+
 # ─── Reconstruction parameters ─────────────────────────────────────────────
 
 # Contour / support points

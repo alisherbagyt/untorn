@@ -14,6 +14,8 @@ from pathlib import Path
 from scipy.ndimage import distance_transform_edt
 
 from . import config as cfg
+from .boundary import attach_subpixel_contours_all
+from .text_lines import attach_text_lines_all
 from .io_utils import save_image, save_mask
 
 
@@ -252,6 +254,19 @@ def analyze_fragments(fragments: list[dict], image_rgb: np.ndarray,
     contour_debug = debug_dir / "contours"
     contour_debug.mkdir(parents=True, exist_ok=True)
 
+    # Sub-pixel boundary refinement: snap each mask-boundary pixel to the
+    # local gradient ridge along its inward normal. Downstream curvature
+    # extraction and edge matching read `frag["contour_subpixel"]` and fall
+    # back to the integer `frag["contour"]` if disabled.
+    if cfg.BOUNDARY_REFINE_ENABLED:
+        print("  Refining fragment boundaries to sub-pixel ...")
+    attach_subpixel_contours_all(fragments, image_rgb)
+
+    # Per-fragment text-line detection (projection profile + baseline fit).
+    # Stored on frag["text_lines"]; used by the matching text-continuity gate.
+    print("  Detecting text baselines ...")
+    attach_text_lines_all(fragments, image_rgb)
+
     print("  Extracting support points and edge descriptors ...")
 
     vis = image_rgb.copy()
@@ -285,6 +300,10 @@ def analyze_fragments(fragments: list[dict], image_rgb: np.ndarray,
 
         # Visualization
         cv2.drawContours(vis, [frag["contour"]], -1, c, 2)
+        for tl in frag.get("text_lines", []):
+            p0 = tuple(np.round(tl["p0"]).astype(int))
+            p1 = tuple(np.round(tl["p1"]).astype(int))
+            cv2.line(vis, p0, p1, c, 1, cv2.LINE_AA)
         for k, pt in enumerate(sp):
             cv2.circle(vis, tuple(pt), 5, c, -1)
             cv2.putText(vis, str(k), (pt[0]+5, pt[1]-5),
@@ -314,17 +333,20 @@ def analyze_fragments(fragments: list[dict], image_rgb: np.ndarray,
         sdf_color[contour_mask > 0] = [255, 255, 255]
         save_image(sdf_color[y0:y1, x0:x1], str(contour_debug / f"sdf_{fid:02d}.png"))
 
+        n_text_lines = len(frag.get("text_lines", []))
         meta = {
             "id": fid,
             "n_support_points": len(sp),
             "n_edge_segments": len(segs),
             "n_boundary_pixels": len(bp),
+            "n_text_lines": n_text_lines,
             "total_perimeter": round(sum(s["length"] for s in segs), 1),
             "edge_lengths": [round(s["length"], 1) for s in segs],
         }
         all_meta.append(meta)
         print(f"    Fragment {fid}: {len(sp)} support pts, "
-              f"{len(segs)} edges, perimeter={meta['total_perimeter']:.0f}px")
+              f"{len(segs)} edges, {n_text_lines} text lines, "
+              f"perimeter={meta['total_perimeter']:.0f}px")
 
     save_image(vis, str(contour_debug / "all_support_points.png"))
     with open(contour_debug / "contours_meta.json", "w") as f:

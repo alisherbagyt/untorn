@@ -623,8 +623,14 @@ def prepare_edges_and_sdt(fragments: list[dict]) -> None:
     transform for each fragment (used by the physical gate).
     """
     for frag in fragments:
+        # Prefer the sub-pixel contour (from boundary.refine_boundary_subpixel)
+        # when available; the integer contour is kept only as a fallback and
+        # for legacy cv2 drawing paths.
+        contour_for_edges = frag.get("contour_subpixel")
+        if contour_for_edges is None or len(contour_for_edges) < 3:
+            contour_for_edges = frag["contour"]
         frag["edges"] = extract_edges_from_contour(
-            frag["contour"], frag["support_points"],
+            contour_for_edges, frag["support_points"],
             frag["mask"], min_edge_length=15.0)
         for e in frag["edges"]:
             if e["is_torn"]:
