@@ -4,7 +4,7 @@ WORKDIR /app
 
 # Install deps separately so this layer caches when only source changes
 COPY frontend/package*.json ./
-RUN npm ci --omit=dev
+RUN npm ci
 
 COPY frontend/ .
 RUN npm run build
