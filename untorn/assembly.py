@@ -789,6 +789,19 @@ def reconstruct(fragments: list[dict],
             "match_cache_hits":     cache.n_hits,
         }, fh, indent=2)
 
+    # Compatibility artifact consumed by backend board endpoint and benchmarks.
+    final_translations = {}
+    for i in range(n):
+        fid = int(fragments[i].get("id", i))
+        T = transforms[i]
+        final_translations[str(fid)] = {
+            "dx": round(float(T[0, 2]), 2),
+            "dy": round(float(T[1, 2]), 2),
+            "placed": bool(i in placed),
+        }
+    with open(recon_debug / "final_translations.json", "w", encoding="utf-8") as fh:
+        json.dump(final_translations, fh, indent=2)
+
     _finalize_release_dinov2(fragments)
     print(f"\n  Assembly complete: {len(placed)}/{n} placed, "
           f"{cache.n_calls} matcher calls / {cache.n_hits} cache hits")

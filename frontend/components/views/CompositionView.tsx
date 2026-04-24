@@ -17,6 +17,11 @@ export function CompositionView({ debug, jobId }: CompositionViewProps) {
   const paths = debug.paths;
   const meta  = debug.composition;
   const inp   = debug.inpainting;
+  const gapPixels =
+    meta?.gap_pixels_inpainted ??
+    // Compatibility with newer backend metadata naming.
+    (meta as { gap_pixels_detected?: number } | undefined)?.gap_pixels_detected ??
+    0;
 
   // Default to cleaned if it's available, otherwise the classical inpaint.
   const hasCleaned =
@@ -42,16 +47,17 @@ export function CompositionView({ debug, jobId }: CompositionViewProps) {
   // If LaMa was skipped or failed, hide the cleaned pill entirely
   const visibleLayers = hasCleaned ? layers : layers.filter((l) => l.key !== "cleaned");
 
-  const coveragePct = meta
-    ? ((meta.gap_pixels_inpainted / (meta.canvas_w * meta.canvas_h)) * 100).toFixed(1)
-    : null;
+  const coveragePct =
+    meta && meta.canvas_w > 0 && meta.canvas_h > 0
+      ? ((gapPixels / (meta.canvas_w * meta.canvas_h)) * 100).toFixed(1)
+      : null;
 
   // Stats row
   const stats: { label: string; value: string }[] = [];
   if (meta) {
     stats.push({ label: "Размер холста", value: `${meta.canvas_w}×${meta.canvas_h}` });
-    stats.push({ label: "Пиксели пробелов", value: meta.gap_pixels_inpainted.toLocaleString() });
-    stats.push({ label: "Покрытие пробелов", value: `${coveragePct}%` });
+    stats.push({ label: "Пиксели пробелов", value: gapPixels.toLocaleString() });
+    stats.push({ label: "Покрытие пробелов", value: coveragePct !== null ? `${coveragePct}%` : "-" });
   }
   if (inp && inp.status === "OK") {
     stats.push({

@@ -162,6 +162,14 @@ async def get_debug(job_id: str):
     result["composition"] = read_json(debug_dir / "composition" / "composition_meta.json")
     result["inpainting"] = read_json(debug_dir / "inpainting" / "inpainting_meta.json")
 
+    # Backward/forward compatibility: older frontend expects gap_pixels_inpainted,
+    # newer composition metadata may expose gap_pixels_detected.
+    if isinstance(result["composition"], dict):
+        if "gap_pixels_inpainted" not in result["composition"]:
+            result["composition"]["gap_pixels_inpainted"] = int(
+                result["composition"].get("gap_pixels_detected", 0) or 0
+            )
+
     translations = result["translations"] if isinstance(result["translations"], dict) else {}
 
     def _to_float(value, default=0.0):
@@ -344,22 +352,45 @@ async def get_board_data(job_id: str):
     composition = read_json(debug_dir / "composition" / "composition_meta.json")
     contours = read_json(debug_dir / "contours" / "contours_meta.json")
 
-    if not fragments or not translations or not composition:
+    if not fragments:
         raise HTTPException(status_code=400, detail="Incomplete pipeline data")
+
+    translations = translations if isinstance(translations, dict) else {}
+    composition = composition if isinstance(composition, dict) else {}
+
+    def _to_float(value, default=0.0):
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    offset_x = _to_float(composition.get("offset_x", 0.0), 0.0)
+    offset_y = _to_float(composition.get("offset_y", 0.0), 0.0)
+    canvas_w = int(_to_float(composition.get("canvas_w", 0), 0))
+    canvas_h = int(_to_float(composition.get("canvas_h", 0), 0))
 
     # Build per-fragment board data
     board_fragments = []
+    min_x = float("inf")
+    min_y = float("inf")
+    max_x = float("-inf")
+    max_y = float("-inf")
     for frag in fragments:
         fid = frag["id"]
         fid_str = str(fid)
-        trans = translations.get(fid_str, {"dx": 0, "dy": 0, "placed": False})
+        trans = translations.get(fid_str, {}) if isinstance(translations, dict) else {}
         bx, by, bw, bh = frag["bbox_xywh"]
 
         # Position on the composition canvas
-        offset_x = composition.get("offset_x", 0)
-        offset_y = composition.get("offset_y", 0)
-        canvas_x = bx + trans["dx"] - offset_x
-        canvas_y = by + trans["dy"] - offset_y
+        dx = _to_float(trans.get("dx", 0.0), 0.0)
+        dy = _to_float(trans.get("dy", 0.0), 0.0)
+        canvas_x = bx + dx - offset_x
+        canvas_y = by + dy - offset_y
+
+        min_x = min(min_x, canvas_x)
+        min_y = min(min_y, canvas_y)
+        max_x = max(max_x, canvas_x + bw)
+        max_y = max(max_y, canvas_y + bh)
 
         board_fragments.append({
             "id": fid,
@@ -368,16 +399,24 @@ async def get_board_data(job_id: str):
             "width": bw,
             "height": bh,
             "rotation": 0,
-            "placed": trans.get("placed", False),
+            "placed": bool(trans.get("placed", False)),
             "area": frag["area"],
             "centroid": frag["centroid"],
             "imageUrl": f"/board/fragment/{job_id}/{fid}",
         })
 
+    if canvas_w <= 0 or canvas_h <= 0:
+        if board_fragments and np.isfinite(min_x) and np.isfinite(min_y) and np.isfinite(max_x) and np.isfinite(max_y):
+            canvas_w = max(1, int(math.ceil(max_x - min_x)))
+            canvas_h = max(1, int(math.ceil(max_y - min_y)))
+        else:
+            canvas_w = 1
+            canvas_h = 1
+
     return {
         "canvas": {
-            "width": composition["canvas_w"],
-            "height": composition["canvas_h"],
+            "width": canvas_w,
+            "height": canvas_h,
         },
         "fragments": board_fragments,
     }

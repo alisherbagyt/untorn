@@ -53,6 +53,7 @@ export interface DebugData {
     canvas_w: number;
     canvas_h: number;
     gap_pixels_inpainted: number;
+    gap_pixels_detected?: number;
     final_w: number;
     final_h: number;
   };
