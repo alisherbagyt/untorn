@@ -33,6 +33,7 @@ export function FragmentTimeline({ debug, selectedId, onSelect }: FragmentTimeli
           const isSelected = selectedId === frag.id;
           const tx = translations[String(frag.id)];
           const connectedTo = connections.get(frag.id);
+          const connectedIds = connectedTo ? Array.from(connectedTo) : [];
           const cropUrl = paths?.fragment_crops?.[idx]
             ? debugImageUrl(paths.fragment_crops[idx])
             : null;
@@ -92,9 +93,9 @@ export function FragmentTimeline({ debug, selectedId, onSelect }: FragmentTimeli
                 </div>
 
                 {/* Connection dots */}
-                {connectedTo && connectedTo.size > 0 && (
+                {connectedIds.length > 0 && (
                   <div className="flex gap-0.5 flex-wrap justify-center max-w-[72px]">
-                    {[...connectedTo].slice(0, 4).map((cid) => (
+                    {connectedIds.slice(0, 4).map((cid) => (
                       <span
                         key={cid}
                         className="text-[9px] bg-accent/10 text-accent rounded-full px-1"
@@ -102,8 +103,8 @@ export function FragmentTimeline({ debug, selectedId, onSelect }: FragmentTimeli
                         #{cid}
                       </span>
                     ))}
-                    {connectedTo.size > 4 && (
-                      <span className="text-[9px] text-secondary">+{connectedTo.size - 4}</span>
+                    {connectedIds.length > 4 && (
+                      <span className="text-[9px] text-secondary">+{connectedIds.length - 4}</span>
                     )}
                   </div>
                 )}
