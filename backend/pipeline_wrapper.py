@@ -90,6 +90,8 @@ def _execute(job_id: str, image_path: str, project_root: str) -> None:
             if not line:
                 continue
 
+            # Mirror child-process output to container stdout for `docker logs` triage.
+            print(f"[pipeline:{job_id[:8]}] {line}", flush=True)
             logs.append(line)
             progress, phase = _parse_line(line)
 
@@ -116,7 +118,18 @@ def _execute(job_id: str, image_path: str, project_root: str) -> None:
         proc.wait()
 
         if proc.returncode != 0:
+            # Try to surface the most actionable traceback line to the UI.
+            detail = ""
+            for entry in reversed(logs):
+                if not entry:
+                    continue
+                if "Traceback" in entry:
+                    continue
+                detail = entry
+                break
             err_msg = f"Pipeline exited with code {proc.returncode}"
+            if detail:
+                err_msg = f"{err_msg}: {detail}"
             update_job(job_id, status="error", error=err_msg, logs=logs[-80:])
         else:
             # Only set done if we haven't already detected error or done via stdout
