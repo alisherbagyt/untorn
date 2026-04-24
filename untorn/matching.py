@@ -1068,7 +1068,8 @@ def match_pair(frag_a: dict, frag_b: dict,
     if not torn_a or not torn_b:
         return None
 
-    centroid_off = frag_b["centroid"] - frag_a["centroid"]
+    centroid_off = (np.asarray(frag_b["centroid"], dtype=np.float64)
+                    - np.asarray(frag_a["centroid"], dtype=np.float64))
     best: dict | None = None
     best_cost = float("inf")
 

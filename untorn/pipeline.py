@@ -5,9 +5,9 @@ Orchestrates the full reconstruction pipeline:
   Phase 0: Preprocessing — downscale large images to fit in GPU VRAM
   Phase 1: Segmentation (SAM 2.1) — on working-resolution image
   Phase 2: Contour analysis — on working-resolution image
-  Phase 3: Hierarchical proximity-based reconstruction
-            (neighbor discovery → corner seeds → L-clusters →
-             perimeter infill → interior infill)
+  Phase 3: Layout-agnostic MST global assembly
+            (candidate enumeration → four-gate matching →
+             seed + MST growth → bundle adjust → orphan rescue)
   Phase 4: Composition — upscale transforms, compose at FULL resolution
   Phase 5: Inpainting — LaMa-based seam/scar cleaning (text-preserving)
 """
@@ -23,7 +23,7 @@ from .io_utils import load_image, save_image
 from .preprocess import prepare_image, upscale_transforms, upscale_fragments
 from .segmentation import segment_fragments
 from .contours import analyze_fragments
-from .reconstruction import reconstruct
+from .assembly import reconstruct
 from .composition import compose_final
 from .inpainting import clean_final, is_available as lama_available
 
@@ -137,7 +137,7 @@ def run(input_path: str, output_path: str = None):
     #  PHASE 3: Hierarchical proximity-based reconstruction
     # ══════════════════════════════════════════════════════════════════════
     print("\n" + "-" * 65)
-    print("[PHASE 3] Hierarchical proximity-based reconstruction")
+    print("[PHASE 3] Layout-agnostic MST global assembly")
     print("-" * 65)
     t0 = time.time()
 

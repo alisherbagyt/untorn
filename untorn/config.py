@@ -135,6 +135,26 @@ CONF_W_STRIP_NCC   = 0.20    # existing 8-px strip NCC
 CONF_W_TEXT_LINE   = 0.20    # text-line continuity (0 when not applicable)
 CONF_W_PAPER_COLOR = 0.10    # 1 - LAB ΔE / MATCH_PAPER_COLOR_DELTA_MAX
 
+# ─── Assembly — layout-agnostic MST-growth orchestration ───────────────────
+# The new `untorn.assembly.reconstruct` replaces the corner-seeded
+# hierarchical orchestrator. It enumerates all torn-edge pairs, scores
+# them through the four-gate matcher, seeds the MST from the highest-
+# confidence pair, and grows outward by repeatedly attaching the highest
+# -confidence match whose one side is already placed. Conflicts (multiple
+# free fragments competing for the same anchor) are resolved by
+# bipartite max-weight matching, and every few placements we fit a
+# global text-line rotation to keep text horizontal.
+
+ASSEMBLY_HIGH_CONFIDENCE_LOCK   = 0.92   # auto-lock (no overlap re-check if seen)
+ASSEMBLY_MIN_CONFIDENCE         = 0.55   # threshold to enter the MST queue
+ASSEMBLY_ORPHAN_MIN_CONFIDENCE  = 0.45   # relaxed bar for last-resort pass
+ASSEMBLY_GLOBAL_ROT_FIX_EVERY   = 5      # apply text-line rotation every N attach
+ASSEMBLY_GLOBAL_ROT_MIN_LINES   = 3      # need at least this many placed baselines
+ASSEMBLY_GLOBAL_ROT_MIN_DEG     = 0.5    # only apply if misalignment exceeds this
+ASSEMBLY_EDGE_LENGTH_RATIO_MAX  = 3.0    # drop candidates whose edges differ by >3x
+ASSEMBLY_MAX_CANDIDATE_PAIRS    = 4000   # safety cap on scored pairs
+ASSEMBLY_MAX_STEPS              = 1024   # safety cap on MST growth steps
+
 # ─── Reconstruction parameters ─────────────────────────────────────────────
 
 # Contour / support points
