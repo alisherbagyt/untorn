@@ -20,7 +20,7 @@ if str(_ROOT) not in sys.path:
 
 import numpy as np
 
-from untorn.reconstruction import _score_edge_appearance
+from untorn.matching import _score_edge_appearance
 
 
 def _make_edge(pts, outward_normal):
