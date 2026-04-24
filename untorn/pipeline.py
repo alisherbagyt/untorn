@@ -9,7 +9,7 @@ Orchestrates the full reconstruction pipeline:
             (candidate enumeration → four-gate matching →
              seed + MST growth → bundle adjust → orphan rescue)
   Phase 4: Composition — upscale transforms, compose at FULL resolution
-  Phase 5: Inpainting — LaMa-based seam/scar cleaning (text-preserving)
+  Phase 5: Gap fill — classify holes, build repair mask, LaMa cleanup
 """
 
 import os
@@ -25,7 +25,8 @@ from .segmentation import segment_fragments
 from .contours import analyze_fragments
 from .assembly import reconstruct
 from .composition import compose_final
-from .inpainting import clean_final, is_available as lama_available
+from .gap_fill import inpaint_gaps
+from .inpainting import is_available as lama_available
 
 
 def run(input_path: str, output_path: str = None):
@@ -178,7 +179,7 @@ def run(input_path: str, output_path: str = None):
     #  PHASE 5: LaMa inpainting — seam/scar cleaning
     # ══════════════════════════════════════════════════════════════════════
     print("\n" + "-" * 65)
-    print("[PHASE 5] Cleaning seams with LaMa inpainting")
+    print("[PHASE 5] Gap fill: classify holes, build repair mask, LaMa")
     print("-" * 65)
     t0 = time.time()
 
@@ -186,9 +187,12 @@ def run(input_path: str, output_path: str = None):
     if not lama_available():
         print("  ! LaMa checkpoint missing - Phase 5 will pass image through unchanged.")
 
-    cleaned_uncropped = clean_final(
-        canvas_uncropped, coverage, gap_mask, debug_dir, refine=refine,
-    )
+    gap_result = inpaint_gaps(canvas_uncropped, coverage,
+                              debug_dir, refine=refine)
+    cleaned_uncropped = gap_result["canvas"]
+    pipeline_meta["missing_fragment"] = bool(
+        gap_result["meta"].get("missing_fragment", False))
+    pipeline_meta["hole_counts"] = gap_result["meta"].get("hole_counts", {})
 
     # Apply the crop bbox that composition deferred to us.
     rx, ry, rw, rh = crop_bbox
