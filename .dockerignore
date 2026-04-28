@@ -1,11 +1,30 @@
 .git
 .idea
 .claude
+.vscode
+
+# Large or local-only assets
+untorn-images.tar
+*.tar
+
+# Runtime data and docs
 data/
+docs/
+tools/
+
+# Python
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.venv/
+**/venv/
+*.egg-info/
+
+# Frontend
 frontend/.next/
 frontend/tsconfig.tsbuildinfo
 **/node_modules/
-**/__pycache__/
-**/*.pyc
-*.egg-info/
+
+# Environment
 .env

@@ -19,6 +19,7 @@ RUN pip install --no-cache-dir -r requirements_web.txt
 COPY backend/ backend/
 COPY untorn/ untorn/
 COPY lama/ lama/
+COPY models/ models/
 COPY run.py .
 
 # Ensure data directories exist (real data is mounted as a volume)
