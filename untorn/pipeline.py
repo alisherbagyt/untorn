@@ -19,6 +19,7 @@ import numpy as np
 from pathlib import Path
 
 from . import config as cfg
+from . import edge_matcher
 from .io_utils import load_image, save_image
 from .preprocess import prepare_image, upscale_transforms, upscale_fragments
 from .segmentation import segment_fragments
@@ -142,7 +143,19 @@ def run(input_path: str, output_path: str = None):
     print("-" * 65)
     t0 = time.time()
 
-    transforms = reconstruct(fragments, work_rgb, debug_dir)
+    # Load the Siamese edge matcher (Phase 4 gate). Failure is non-fatal —
+    # `edge_matcher.load()` logs and returns None when torch / the
+    # checkpoint is missing, and `_match_edge_pair` checks `is_loaded()`
+    # before calling so the pipeline degrades to the legacy 4-gate cascade.
+    if getattr(cfg, "EDGE_MATCHER_ENABLED", False):
+        edge_matcher.load()
+    pipeline_meta["edge_matcher_loaded"] = bool(edge_matcher.is_loaded())
+
+    try:
+        transforms = reconstruct(fragments, work_rgb, debug_dir)
+    finally:
+        # Free GPU memory before LaMa (Phase 5) loads its own weights.
+        edge_matcher.unload()
 
     t1 = time.time()
     timings["reconstruction"] = round(t1 - t0, 2)

@@ -205,7 +205,10 @@ def _morphological_cleanup(mask_uint8: np.ndarray,
 
     cleaned = cv2.morphologyEx(mask_uint8, cv2.MORPH_CLOSE, kernel_close)
     cleaned = cv2.morphologyEx(cleaned,    cv2.MORPH_OPEN,  kernel_open)
-    cleaned = cv2.GaussianBlur(cleaned, (5, 5), 0)
+    # Note: previously we Gaussian-blurred and re-thresholded the mask here.
+    # That blur softened the very edge curvature the matcher reads later
+    # (and the boundary-refine step already snaps each pixel to the local
+    # gradient ridge). Dropped in Step 1 cleanup.
     cleaned = (cleaned > 127).astype(np.uint8) * 255
     return cleaned
 
@@ -467,14 +470,8 @@ def _save_corner_debug(image_rgb: np.ndarray,
     swatch_h, swatch_w = 60, 200
     bg_bgr = cv2.cvtColor(
         np.array([[bg_lab]], dtype=np.float32), cv2.COLOR_LAB2BGR
-    )[0, 0]
-    bg_bgr_uint8 = np.clip(bg_bgr * 255 / 255, 0, 255).astype(np.uint8)
-    # LAB→BGR gives values in [0,255] directly in OpenCV float domain
-    bg_bgr_uint8 = cv2.cvtColor(
-        np.array([[bg_lab]], dtype=np.float32),
-        cv2.COLOR_LAB2BGR
     )
-    bg_bgr_uint8 = np.clip(bg_bgr_uint8[0, 0], 0, 255).astype(np.uint8)
+    bg_bgr_uint8 = np.clip(bg_bgr[0, 0], 0, 255).astype(np.uint8)
 
     swatch = np.full((swatch_h, swatch_w, 3),
                      bg_bgr_uint8.tolist(), dtype=np.uint8)

@@ -1,17 +1,25 @@
 """
 untorn.contours
 ===============
-Phase 2: Extract contours, support points, and edge descriptors.
+Phase 2: Extract contours, support points, and curvature features.
 
-Based on Richter thesis §3.3 (polygonal approximation),
-§4.2-4.4 (support point features), §6.3.1 (compatibility scores).
+Per-fragment fields stored on the dict:
+    contour_subpixel, support_points, boundary_pixels, text_lines
+
+Each torn edge gets a curvature string downstream in matching.prepare_edges_
+and_sdt; the per-edge data is built by `fragment_io` (Step 2 onwards).
+
+Note (post Step 1 cleanup): we no longer store `edge_segments`, `sdf`, or
+`color_profile` on the fragment dict — those were never consumed downstream
+and the SDT is regenerated as `_sdt_interior` inside `matching.prepare_edges_
+and_sdt` from the current sub-pixel-aware mask. The SDF visualisation PNG is
+still emitted because the frontend reads it.
 """
 
 import json
 import numpy as np
 import cv2
 from pathlib import Path
-from scipy.ndimage import distance_transform_edt
 
 from . import config as cfg
 from .boundary import attach_subpixel_contours_all
@@ -74,15 +82,15 @@ def extract_boundary_pixels(mask: np.ndarray) -> np.ndarray:
     return np.column_stack([xs, ys])
 
 
-def compute_signed_distance_map(mask: np.ndarray) -> np.ndarray:
+def _signed_distance_for_viz(mask: np.ndarray) -> np.ndarray:
+    """SDT used only for the per-fragment debug PNG. Float32 H×W;
+    positive = inside, negative = outside. Computed with cv2.distanceTransform
+    (faster than scipy and within ±0.5 px of the true Euclidean distance).
     """
-    Signed distance transform (Thesis §8.4).
-    Positive = inside (foreground), negative = outside (background), 0 = boundary.
-    """
-    fg = mask > 127
-    bg = ~fg
-    dist_fg = distance_transform_edt(fg)
-    dist_bg = distance_transform_edt(bg)
+    fg = (mask > 127).astype(np.uint8) * 255
+    bg = (mask <= 127).astype(np.uint8) * 255
+    dist_fg = cv2.distanceTransform(fg, cv2.DIST_L2, 3).astype(np.float32)
+    dist_bg = cv2.distanceTransform(bg, cv2.DIST_L2, 3).astype(np.float32)
     return dist_fg - dist_bg
 
 
@@ -197,108 +205,47 @@ def compute_curvature_string(pts: np.ndarray,
     return resampled, curvature
 
 
-def extract_edge_color_profile(image_rgb: np.ndarray, mask: np.ndarray,
-                                contour: np.ndarray, depth: int = 8) -> np.ndarray:
-    """
-    Extract color profile along the inside of the contour boundary (Thesis §4.4.1 LCE).
-    For each boundary point, sample `depth` pixels inward and store their colors.
-    Returns Nx(depth*3) array.
-    """
-    h, w = image_rgb.shape[:2]
-    boundary_pts = sample_contour_pixels(contour, n_samples=300)
-
-    # Compute contour normals (inward)
-    n_pts = len(boundary_pts)
-    profiles = []
-    for i in range(n_pts):
-        p = boundary_pts[i]
-        p_prev = boundary_pts[(i - 1) % n_pts]
-        p_next = boundary_pts[(i + 1) % n_pts]
-
-        tangent = p_next - p_prev
-        tlen = np.linalg.norm(tangent)
-        if tlen < 1e-6:
-            continue
-        tangent /= tlen
-
-        # Inward normal: for CCW contour, rotate tangent 90° clockwise
-        normal = np.array([tangent[1], -tangent[0]])
-
-        # Check if normal points inward (should point into the mask)
-        test_pt = (p + normal * 3).astype(int)
-        if 0 <= test_pt[0] < w and 0 <= test_pt[1] < h:
-            if mask[test_pt[1], test_pt[0]] == 0:
-                normal = -normal  # flip
-
-        # Sample depth pixels inward
-        colors = []
-        for d in range(1, depth + 1):
-            sp = (p + normal * d).astype(int)
-            sx, sy = np.clip(sp[0], 0, w-1), np.clip(sp[1], 0, h-1)
-            if mask[sy, sx] > 0:
-                colors.extend(image_rgb[sy, sx].tolist())
-            else:
-                colors.extend([0, 0, 0])
-
-        profiles.append(colors)
-
-    return np.array(profiles, dtype=np.float32) if profiles else np.zeros((0, depth*3), dtype=np.float32)
-
-
 def analyze_fragments(fragments: list[dict], image_rgb: np.ndarray,
                       debug_dir: Path) -> list[dict]:
     """
-    Compute support points, edge segments, boundary info, and color profiles
-    for each fragment. Saves debug output.
+    Phase 2 entry point. Delegates per-fragment analysis to
+    `fragment_io.build_all` (single ingest path) and renders the debug
+    overlays + meta JSON.
+
+    Post-Step-2 the per-fragment fields (contour_subpixel, support_points,
+    boundary_pixels, edges with curvature strings, _sdt_interior, text_lines,
+    text_angle_canonical, paper_lab, ink_density) are all populated by
+    fragment_io. This wrapper only emits the debug artefacts the frontend
+    consumes.
     """
+    from . import fragment_io
+
     contour_debug = debug_dir / "contours"
     contour_debug.mkdir(parents=True, exist_ok=True)
 
-    # Sub-pixel boundary refinement: snap each mask-boundary pixel to the
-    # local gradient ridge along its inward normal. Downstream curvature
-    # extraction and edge matching read `frag["contour_subpixel"]` and fall
-    # back to the integer `frag["contour"]` if disabled.
-    if cfg.BOUNDARY_REFINE_ENABLED:
-        print("  Refining fragment boundaries to sub-pixel ...")
-    attach_subpixel_contours_all(fragments, image_rgb)
-
-    # Per-fragment text-line detection (projection profile + baseline fit).
-    # Stored on frag["text_lines"]; used by the matching text-continuity gate.
-    print("  Detecting text baselines ...")
-    attach_text_lines_all(fragments, image_rgb)
-
-    print("  Extracting support points and edge descriptors ...")
+    print("  Per-fragment canonical analysis (boundary, edges, text, paper) ...")
+    fragment_io.build_all(fragments, image_rgb)
 
     vis = image_rgb.copy()
-    colors = [(255,0,0),(0,255,0),(0,0,255),(255,255,0),(255,0,255),
-              (0,255,255),(128,0,0),(0,128,0),(0,0,128),(128,128,0)]
-    all_meta = []
+    colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255),
+              (0, 255, 255), (128, 0, 0), (0, 128, 0), (0, 0, 128), (128, 128, 0)]
+    all_meta: list[dict] = []
 
     for frag in fragments:
         fid = frag["id"]
         c = colors[fid % len(colors)]
+        sp = frag["support_points"]
+        bp = frag["boundary_pixels"]
+        edges = frag.get("edges", [])
 
-        # Support points
-        sp = extract_support_points(frag["contour"])
-        frag["support_points"] = sp
-
-        # Edge segments
+        # Polygon-segment lengths derived from support points — used only for
+        # the meta JSON (frontend chart reads `edge_lengths`).
         segs = compute_edge_segments(sp)
-        frag["edge_segments"] = segs
 
-        # Boundary pixels
-        bp = extract_boundary_pixels(frag["mask"])
-        frag["boundary_pixels"] = bp
+        # Whole-fragment SDT for visualization only.
+        sdf = _signed_distance_for_viz(frag["mask"])
 
-        # Signed distance map
-        sdf = compute_signed_distance_map(frag["mask"])
-        frag["sdf"] = sdf
-
-        # Edge color profile
-        color_prof = extract_edge_color_profile(image_rgb, frag["mask"], frag["contour"])
-        frag["color_profile"] = color_prof
-
-        # Visualization
+        # All-fragments overlay: contour, baselines, support points.
         cv2.drawContours(vis, [frag["contour"]], -1, c, 2)
         for tl in frag.get("text_lines", []):
             p0 = tuple(np.round(tl["p0"]).astype(int))
@@ -306,47 +253,58 @@ def analyze_fragments(fragments: list[dict], image_rgb: np.ndarray,
             cv2.line(vis, p0, p1, c, 1, cv2.LINE_AA)
         for k, pt in enumerate(sp):
             cv2.circle(vis, tuple(pt), 5, c, -1)
-            cv2.putText(vis, str(k), (pt[0]+5, pt[1]-5),
+            cv2.putText(vis, str(k), (pt[0] + 5, pt[1] - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, c, 1)
 
-        # Save individual support point image
+        # Per-fragment support-points crop.
         frag_vis = image_rgb.copy()
         cv2.drawContours(frag_vis, [frag["contour"]], -1, c, 2)
         for pt in sp:
             cv2.circle(frag_vis, tuple(pt), 5, c, -1)
         x, y, bw, bh = frag["bbox"]
         pad = 30
-        x0, y0 = max(0, x-pad), max(0, y-pad)
-        x1, y1 = min(image_rgb.shape[1], x+bw+pad), min(image_rgb.shape[0], y+bh+pad)
-        save_image(frag_vis[y0:y1, x0:x1], str(contour_debug / f"support_pts_{fid:02d}.png"))
+        x0, y0 = max(0, x - pad), max(0, y - pad)
+        x1, y1 = min(image_rgb.shape[1], x + bw + pad), min(image_rgb.shape[0], y + bh + pad)
+        save_image(frag_vis[y0:y1, x0:x1],
+                   str(contour_debug / f"support_pts_{fid:02d}.png"))
 
-        # Save SDF visualization — clamp to [-50, +50] for visible detail
+        # SDF debug PNG, clamped to [-50, +50] for visible detail.
         clamp = 50.0
         sdf_clamped = np.clip(sdf, -clamp, clamp)
-        # Normalize to 0-255: -50→0, 0→128, +50→255
         sdf_u8 = ((sdf_clamped + clamp) / (2 * clamp) * 255).astype(np.uint8)
         sdf_color = cv2.applyColorMap(sdf_u8, cv2.COLORMAP_JET)
         sdf_color = cv2.cvtColor(sdf_color, cv2.COLOR_BGR2RGB)
-        # Overlay contour in white for reference
         contour_mask = np.zeros(sdf.shape, dtype=np.uint8)
         cv2.drawContours(contour_mask, [frag["contour"]], -1, 255, 2)
         sdf_color[contour_mask > 0] = [255, 255, 255]
-        save_image(sdf_color[y0:y1, x0:x1], str(contour_debug / f"sdf_{fid:02d}.png"))
+        save_image(sdf_color[y0:y1, x0:x1],
+                   str(contour_debug / f"sdf_{fid:02d}.png"))
 
         n_text_lines = len(frag.get("text_lines", []))
+        n_torn = sum(1 for e in edges if e.get("is_torn"))
+        n_factory = len(edges) - n_torn
+        text_angle = frag.get("text_angle_canonical")
         meta = {
-            "id": fid,
-            "n_support_points": len(sp),
-            "n_edge_segments": len(segs),
-            "n_boundary_pixels": len(bp),
-            "n_text_lines": n_text_lines,
-            "total_perimeter": round(sum(s["length"] for s in segs), 1),
-            "edge_lengths": [round(s["length"], 1) for s in segs],
+            "id":                  fid,
+            "n_support_points":    len(sp),
+            "n_edge_segments":     len(segs),
+            "n_boundary_pixels":   len(bp),
+            "n_text_lines":        n_text_lines,
+            "n_torn_edges":        n_torn,
+            "n_factory_edges":     n_factory,
+            "total_perimeter":     round(sum(s["length"] for s in segs), 1),
+            "edge_lengths":        [round(s["length"], 1) for s in segs],
+            "text_angle_deg":      (round(float(np.degrees(text_angle)), 2)
+                                     if text_angle is not None else None),
+            "ink_density":         round(float(frag.get("ink_density", 0.0)), 4),
         }
         all_meta.append(meta)
-        print(f"    Fragment {fid}: {len(sp)} support pts, "
-              f"{len(segs)} edges, {n_text_lines} text lines, "
-              f"perimeter={meta['total_perimeter']:.0f}px")
+        print(f"    Fragment {fid}: {len(sp)} sp, "
+              f"{n_torn} torn / {n_factory} factory edges, "
+              f"{n_text_lines} text lines, "
+              f"perimeter={meta['total_perimeter']:.0f}px"
+              + (f", text_angle={meta['text_angle_deg']:+.1f}°"
+                 if text_angle is not None else ""))
 
     save_image(vis, str(contour_debug / "all_support_points.png"))
     with open(contour_debug / "contours_meta.json", "w") as f:

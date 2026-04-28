@@ -6,6 +6,7 @@ and updates the job state store in real time.
 import os
 import sys
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 from .services.job_service import update_job, PIPELINE_SEMAPHORE
@@ -17,7 +18,7 @@ _PHASE_START = {
     "[PHASE 2]": (45, "contours"),
     "[PHASE 3]": (55, "reconstruction"),
     "[PHASE 4]": (82, "composition"),
-    "[PHASE 5]": (90, "inpainting"),
+    "[PHASE 5]": (90, "gap_fill"),
 }
 
 _PHASE_DONE = {
@@ -26,7 +27,7 @@ _PHASE_DONE = {
     "Phase 2 complete": (54, "contours"),
     "Phase 3 complete": (81, "reconstruction"),
     "Phase 4 complete": (89, "composition"),
-    "Phase 5 complete": (98, "inpainting"),
+    "Phase 5 complete": (98, "gap_fill"),
 }
 
 def _parse_line(line: str):
@@ -60,8 +61,14 @@ def run_pipeline(job_id: str, image_path: str, project_root: str) -> None:
 
 
 def _execute(job_id: str, image_path: str, project_root: str) -> None:
-    update_job(job_id, status="processing", progress=2, current_phase="preprocessing",
-               logs=["Starting pipeline..."])
+    update_job(
+        job_id,
+        status="processing",
+        progress=2,
+        current_phase="preprocessing",
+        logs=["Starting pipeline..."],
+        started_at=datetime.utcnow().isoformat(),
+    )
 
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
@@ -96,14 +103,26 @@ def _execute(job_id: str, image_path: str, project_root: str) -> None:
             progress, phase = _parse_line(line)
 
             if phase == "error":
-                update_job(job_id, status="error", current_phase="error",
-                           logs=logs[-80:], error=line)
+                update_job(
+                    job_id,
+                    status="error",
+                    current_phase="error",
+                    logs=logs[-80:],
+                    error=line,
+                    finished_at=datetime.utcnow().isoformat(),
+                )
                 proc.wait()
                 return
 
             if phase == "done":
-                update_job(job_id, status="done", progress=100,
-                           current_phase="done", logs=logs[-80:])
+                update_job(
+                    job_id,
+                    status="done",
+                    progress=100,
+                    current_phase="done",
+                    logs=logs[-80:],
+                    finished_at=datetime.utcnow().isoformat(),
+                )
                 proc.wait()
                 return
 
@@ -130,17 +149,34 @@ def _execute(job_id: str, image_path: str, project_root: str) -> None:
             err_msg = f"Pipeline exited with code {proc.returncode}"
             if detail:
                 err_msg = f"{err_msg}: {detail}"
-            update_job(job_id, status="error", error=err_msg, logs=logs[-80:])
+            update_job(
+                job_id,
+                status="error",
+                error=err_msg,
+                logs=logs[-80:],
+                finished_at=datetime.utcnow().isoformat(),
+            )
         else:
             # Only set done if we haven't already detected error or done via stdout
             current_status = _get_job_status(job_id)
             if current_status not in ("done", "error"):
-                update_job(job_id, status="done", progress=100,
-                           current_phase="done", logs=logs[-80:])
+                update_job(
+                    job_id,
+                    status="done",
+                    progress=100,
+                    current_phase="done",
+                    logs=logs[-80:],
+                    finished_at=datetime.utcnow().isoformat(),
+                )
 
     except Exception as exc:
-        update_job(job_id, status="error", error=str(exc),
-                   logs=[f"Fatal error: {exc}"])
+        update_job(
+            job_id,
+            status="error",
+            error=str(exc),
+            logs=[f"Fatal error: {exc}"],
+            finished_at=datetime.utcnow().isoformat(),
+        )
 
 
 def _get_job_status(job_id: str) -> str:

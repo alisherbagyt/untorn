@@ -52,8 +52,8 @@ interface AssemblyViewProps {
 // ── Constants ───────────────────────────────────────────────────────────────
 
 const ROTATION_STEP = 0.15; // degrees per px of horizontal drag
-const MIN_ZOOM = 0.05;
-const MAX_ZOOM = 5;
+const MIN_ZOOM = 0.2;
+const MAX_ZOOM = 3.5;
 const ZOOM_SENSITIVITY = 0.001;
 const ZOOM_BUTTON_STEP = 0.15;
 const GRID_SIZE = 20;
@@ -99,7 +99,8 @@ export function AssemblyView({ jobId }: AssemblyViewProps) {
   const [panStart, setPanStart] = useState({ x: 0, y: 0, panX: 0, panY: 0 });
 
   /* ── UI toggles ──────────────────────────────────────────────────────── */
-  const [showLayers, setShowLayers] = useState(false);
+  const [showLayers, setShowLayers] = useState(true);
+  const [showInspector, setShowInspector] = useState(true);
   const [showGrid, setShowGrid] = useState(true);
   const [exportScale, setExportScale] = useState(2);
   const [exporting, setExporting] = useState(false);
@@ -123,16 +124,6 @@ export function AssemblyView({ jobId }: AssemblyViewProps) {
   const undoStack = useRef<FragmentState[][]>([]);
   const [undoCount, setUndoCount] = useState(0); // just to trigger re-renders
 
-  /* ── Refs ─────────────────────────────────────────────────────────────── */
-  const containerRef = useRef<HTMLDivElement>(null);
-  const topZRef = useRef(100);
-
-  // Keep zoom/pan in refs so the native wheel listener always sees latest
-  const zoomRef = useRef(zoom);
-  const panRef = useRef(pan);
-  useEffect(() => { zoomRef.current = zoom; }, [zoom]);
-  useEffect(() => { panRef.current = pan; }, [pan]);
-
   /* ── Undo helpers ────────────────────────────────────────────────────── */
 
   const saveUndo = useCallback(() => {
@@ -150,37 +141,79 @@ export function AssemblyView({ jobId }: AssemblyViewProps) {
     if (prev) setFragments(prev);
   }, []);
 
+  /* ── Refs ─────────────────────────────────────────────────────────────── */
+  const containerRef = useRef<HTMLDivElement>(null);
+  const topZRef = useRef(100);
+
+  // Keep zoom/pan in refs so the native wheel listener always sees latest
+  const zoomRef = useRef(zoom);
+  const panRef = useRef(pan);
+  useEffect(() => { zoomRef.current = zoom; }, [zoom]);
+  useEffect(() => { panRef.current = pan; }, [pan]);
+
   /* ── Compute fit zoom ────────────────────────────────────────────────── */
-
-  const computeFitZoom = useCallback(() => {
-    if (!boardData || !containerRef.current) return 0.5;
-    const rect = containerRef.current.getBoundingClientRect();
-    const scaleX = (rect.width - 80) / boardData.canvas.width;
-    const scaleY = (rect.height - 80) / boardData.canvas.height;
-    return Math.min(scaleX, scaleY, 1);
-  }, [boardData]);
-
-  const fitToView = useCallback(() => {
-    const fitZoom = computeFitZoom();
-    if (!boardData || !containerRef.current) return;
-    const rect = containerRef.current.getBoundingClientRect();
-    setZoom(fitZoom);
-    setPan({
-      x: (rect.width - boardData.canvas.width * fitZoom) / 2,
-      y: (rect.height - boardData.canvas.height * fitZoom) / 2,
-    });
-  }, [boardData, computeFitZoom]);
 
   const clampZoom = useCallback(
     (z: number) => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, z)),
     []
   );
 
+  const computeContentBounds = useCallback((items: FragmentState[]) => {
+    if (!items.length) {
+      return {
+        minX: 0,
+        minY: 0,
+        maxX: boardData?.canvas.width ?? 0,
+        maxY: boardData?.canvas.height ?? 0,
+      };
+    }
+    let minX = Number.POSITIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+    for (const f of items) {
+      minX = Math.min(minX, f.x);
+      minY = Math.min(minY, f.y);
+      maxX = Math.max(maxX, f.x + f.width);
+      maxY = Math.max(maxY, f.y + f.height);
+    }
+    return { minX, minY, maxX, maxY };
+  }, [boardData]);
+
+  const computeFitZoom = useCallback((items: FragmentState[]) => {
+    if (!containerRef.current) return 0.5;
+    const rect = containerRef.current.getBoundingClientRect();
+    const bounds = computeContentBounds(items);
+    const width = Math.max(1, bounds.maxX - bounds.minX);
+    const height = Math.max(1, bounds.maxY - bounds.minY);
+    const scaleX = (rect.width - 120) / width;
+    const scaleY = (rect.height - 120) / height;
+    return clampZoom(Math.min(scaleX, scaleY, 1));
+  }, [computeContentBounds, clampZoom]);
+
+  const fitToView = useCallback((items: FragmentState[] = fragments) => {
+    if (!containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const bounds = computeContentBounds(items);
+    const fitZoom = computeFitZoom(items);
+    const contentW = Math.max(1, bounds.maxX - bounds.minX);
+    const contentH = Math.max(1, bounds.maxY - bounds.minY);
+    setZoom(fitZoom);
+    setPan({
+      x: (rect.width - contentW * fitZoom) / 2 - bounds.minX * fitZoom,
+      y: (rect.height - contentH * fitZoom) / 2 - bounds.minY * fitZoom,
+    });
+  }, [computeContentBounds, computeFitZoom, fragments]);
+
   /* ── Load board data ─────────────────────────────────────────────────── */
 
   useEffect(() => {
+    let mounted = true;
+    setLoading(true);
+    setError(null);
     fetchBoardData(jobId)
       .then((data) => {
+        if (!mounted) return;
         setBoardData(data);
         const minX = Math.min(...data.fragments.map((f) => f.x));
         const minY = Math.min(...data.fragments.map((f) => f.y));
@@ -199,74 +232,71 @@ export function AssemblyView({ jobId }: AssemblyViewProps) {
         setFragments(initial);
         setInitialFragments(initial.map((f) => ({ ...f })));
         setLoading(false);
+        requestAnimationFrame(() => {
+          if (!mounted) return;
+          fitToView(initial);
+        });
       })
       .catch((e) => {
-        setError(e.message);
+        if (!mounted) return;
+        setError(e?.message ?? "Failed to load board data");
         setLoading(false);
       });
+    return () => { mounted = false; };
   }, [jobId]);
 
-  // Auto-fit when data is ready
-  useEffect(() => {
-    if (boardData && containerRef.current) {
-      requestAnimationFrame(() => fitToView());
-    }
-  }, [boardData]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  /* ── Preload fragment images as blobs ────────────────────────────────── */
+  /* ── Load fragment images (blob cache) ───────────────────────────────── */
 
   useEffect(() => {
-    if (!boardData) return;
     let mounted = true;
-    let count = 0;
+    if (!boardData) return () => { mounted = false; };
+
+    setImagesLoaded(0);
     blobUrls.current.forEach((url) => URL.revokeObjectURL(url));
     blobUrls.current.clear();
 
-    boardData.fragments.forEach((f) => {
-      const url = boardFragmentUrl(jobId, f.id);
-      fetch(url)
-        .then((res) => {
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
-          return res.blob();
-        })
-        .then((blob) => {
+    const load = async () => {
+      for (const frag of boardData.fragments) {
+        try {
+          const res = await fetch(boardFragmentUrl(jobId, frag.id));
+          const blob = await res.blob();
           if (!mounted) return;
-          blobUrls.current.set(f.id, URL.createObjectURL(blob));
-          count++;
-          setImagesLoaded(count);
-        })
-        .catch(() => {
-          count++;
-          if (mounted) setImagesLoaded(count);
-        });
-    });
-    return () => { mounted = false; };
+          const url = URL.createObjectURL(blob);
+          blobUrls.current.set(frag.id, url);
+          setImagesLoaded((c) => c + 1);
+        } catch {
+          if (!mounted) return;
+          setImagesLoaded((c) => c + 1);
+        }
+      }
+    };
+
+    load();
+    return () => {
+      mounted = false;
+      blobUrls.current.forEach((url) => URL.revokeObjectURL(url));
+      blobUrls.current.clear();
+    };
   }, [boardData, jobId]);
 
-  useEffect(() => {
-    return () => { blobUrls.current.forEach((url) => URL.revokeObjectURL(url)); };
-  }, []);
-
-  /* ── Native wheel handler (passive: false to prevent page scroll) ──── */
+  /* ── Scroll-wheel zoom ───────────────────────────────────────────────── */
 
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
 
     const handler = (e: WheelEvent) => {
+      if (!boardData) return;
       e.preventDefault();
-      e.stopPropagation();
 
       const rect = el.getBoundingClientRect();
       const mouseX = e.clientX - rect.left;
       const mouseY = e.clientY - rect.top;
-
       const prevZoom = zoomRef.current;
-      const delta = -e.deltaY * ZOOM_SENSITIVITY;
-      const newZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, prevZoom * (1 + delta)));
-      const ratio = newZoom / prevZoom;
+      const newZoom = clampZoom(prevZoom - e.deltaY * ZOOM_SENSITIVITY);
+      if (newZoom === prevZoom) return;
 
-      // Zoom toward cursor: keep the point under the mouse fixed
+      const ratio = newZoom / prevZoom;
       const prevPan = panRef.current;
       const newPanX = mouseX - ratio * (mouseX - prevPan.x);
       const newPanY = mouseY - ratio * (mouseY - prevPan.y);
@@ -277,7 +307,16 @@ export function AssemblyView({ jobId }: AssemblyViewProps) {
 
     el.addEventListener("wheel", handler, { passive: false });
     return () => el.removeEventListener("wheel", handler);
-  }, [boardData]); // re-attach after data loads (container may remount)
+  }, [boardData, clampZoom]);
+
+  /* ── Resize → re-fit ─────────────────────────────────────────────────── */
+
+  useEffect(() => {
+    if (!boardData) return;
+    const onResize = () => fitToView();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [boardData, fitToView]);
 
   /* ── Keyboard shortcuts ──────────────────────────────────────────────── */
 
@@ -637,6 +676,13 @@ export function AssemblyView({ jobId }: AssemblyViewProps) {
     [fragments]
   );
 
+  const updateSelected = useCallback((patch: Partial<FragmentState>) => {
+    if (selectedId === null) return;
+    setFragments((prev) =>
+      prev.map((f) => (f.id === selectedId ? { ...f, ...patch } : f))
+    );
+  }, [selectedId]);
+
   /* ── Scrollbar helpers ─────────────────────────────────────────────────── */
 
   const startScrollDrag = useCallback(
@@ -725,24 +771,32 @@ export function AssemblyView({ jobId }: AssemblyViewProps) {
 
   const totalFragments = boardData?.fragments.length ?? 0;
   const allLoaded = imagesLoaded >= totalFragments;
+  const selectedFrag = fragments.find((f) => f.id === selectedId) ?? null;
+  const placedCount = fragments.filter((f) => f.placed).length;
 
   return (
     <div className="space-y-3">
-      {/* ── Toolbar ─────────────────────────────────────────────────────── */}
-      <div className="flex items-center justify-between flex-wrap gap-2">
-        {/* Left group */}
+      {/* ── Top bar ─────────────────────────────────────────────────────── */}
+      <div className="flex items-center justify-between flex-wrap gap-2 rounded-2xl border border-border/60 bg-white/80 backdrop-blur px-3 py-2 shadow-card">
         <div className="flex items-center gap-1.5">
           <Button variant="outline" size="sm" onClick={handleReset} title="Reset all positions">
             <RotateCcw size={14} />
-            <span className="hidden sm:inline">Reset</span>
+            <span className="hidden sm:inline">Сброс</span>
           </Button>
           <Button variant="outline" size="sm" onClick={fitToView} title="Fit to view">
             <Maximize size={14} />
-            <span className="hidden sm:inline">Fit</span>
+            <span className="hidden sm:inline">Вписать</span>
           </Button>
-
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={undo}
+            disabled={undoCount === 0}
+            title="Undo (Ctrl+Z)"
+          >
+            <Undo2 size={14} />
+          </Button>
           <div className="w-px h-5 bg-border mx-0.5" />
-
           <Button
             variant={showGrid ? "default" : "outline"}
             size="sm"
@@ -760,29 +814,24 @@ export function AssemblyView({ jobId }: AssemblyViewProps) {
             <Layers size={14} />
           </Button>
           <Button
-            variant="outline"
+            variant={showInspector ? "default" : "outline"}
             size="sm"
-            onClick={undo}
-            disabled={undoCount === 0}
-            title="Undo (Ctrl+Z)"
+            onClick={() => setShowInspector((v) => !v)}
+            title="Toggle inspector"
           >
-            <Undo2 size={14} />
+            <Settings size={14} />
           </Button>
-
-          <div className="text-[11px] text-secondary px-2 hidden lg:flex items-center gap-3">
-            <span>Drag to move</span>
-            <span className="text-border">|</span>
-            <span>Right-drag to rotate</span>
-            <span className="text-border">|</span>
-            <span>Scroll to zoom</span>
-            <span className="text-border">|</span>
-            <span>Hold Space to pan</span>
-          </div>
         </div>
 
-        {/* Right group */}
-        <div className="flex items-center gap-2 relative">
-          {/* Export quality selector */}
+        <div className="flex items-center gap-2 text-xs text-secondary">
+          <span className="hidden md:inline">{placedCount}/{totalFragments} размещено</span>
+          {selectedId !== null && (
+            <span className="rounded-full bg-accent/10 text-accent px-2 py-0.5">Выбрано #{selectedId}</span>
+          )}
+          <span className="rounded-full bg-muted px-2 py-0.5">{Math.round(zoom * 100)}%</span>
+        </div>
+
+        <div className="flex items-center gap-2">
           <div className="flex items-center gap-0.5 bg-muted rounded-lg p-0.5">
             {[1, 2, 4].map((s) => (
               <button
@@ -800,56 +849,6 @@ export function AssemblyView({ jobId }: AssemblyViewProps) {
               </button>
             ))}
           </div>
-
-          {/* Advanced export options toggle */}
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setShowAdvanced((v) => !v)}
-            title="Параметры экспорта"
-          >
-            <Settings size={14} />
-          </Button>
-
-          {/* Popover with clean/refine toggles */}
-          {showAdvanced && (
-            <div className="absolute top-full right-0 mt-2 z-40 bg-white border border-border rounded-2xl shadow-card p-4 w-72 space-y-3">
-              <div className="text-xs font-semibold text-primary">Экспорт</div>
-
-              <label className="flex items-start gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  className="mt-0.5"
-                  checked={showRaw}
-                  onChange={(e) => setShowRaw(e.target.checked)}
-                />
-                <span className="text-xs text-secondary leading-snug">
-                  <span className="font-medium text-primary">Показать необработанный</span>
-                  <br />
-                  Отключить чистку швов LaMa (по умолчанию включена).
-                </span>
-              </label>
-
-              <label className={cn(
-                "flex items-start gap-2 cursor-pointer",
-                showRaw && "opacity-40 pointer-events-none"
-              )}>
-                <input
-                  type="checkbox"
-                  className="mt-0.5"
-                  checked={refine}
-                  onChange={(e) => setRefine(e.target.checked)}
-                  disabled={showRaw}
-                />
-                <span className="text-xs text-secondary leading-snug">
-                  <span className="font-medium text-primary">Высокое качество (медленно)</span>
-                  <br />
-                  Режим refinement LaMa. Может занять 20–60 секунд.
-                </span>
-              </label>
-            </div>
-          )}
-
           <Button
             variant="default"
             size="sm"
@@ -871,32 +870,138 @@ export function AssemblyView({ jobId }: AssemblyViewProps) {
         </div>
       </div>
 
-      {/* ── Canvas area ─────────────────────────────────────────────────── */}
-      <div
-        ref={containerRef}
-        className="relative w-full rounded-2xl overflow-hidden select-none"
-        style={{
-          height: "calc(100vh - 260px)",
-          minHeight: 420,
-          cursor: isPanning || scrollDrag
-            ? "grabbing"
-            : spaceHeld
-              ? "grab"
-              : dragState
-                ? "grabbing"
-                : "default",
-          // Dark surround for canvas contrast
-          background: "#1a1a1e",
-          // Subtle dot pattern on the surround
-          backgroundImage: "radial-gradient(circle, rgba(255,255,255,0.03) 1px, transparent 1px)",
-          backgroundSize: "24px 24px",
-        }}
-        onMouseDown={handleCanvasMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseUp}
-        onContextMenu={(e) => e.preventDefault()}
-      >
+      <div className="grid grid-cols-1 lg:grid-cols-[260px_minmax(0,1fr)_300px] gap-3">
+        {/* ── Layers sidebar ───────────────────────────────────────────── */}
+        <aside className={cn("flex flex-col gap-3", showLayers ? "flex" : "hidden", "lg:flex")}
+          style={{ minHeight: 240 }}>
+          <div className="rounded-2xl border border-border/60 bg-white/90 shadow-card overflow-hidden">
+            <div className="flex items-center justify-between px-3 py-2 border-b border-border/50">
+              <span className="text-xs font-semibold text-primary flex items-center gap-1.5">
+                <Layers size={12} />
+                Слои
+                <span className="text-secondary font-normal">({totalFragments})</span>
+              </span>
+              <button
+                onClick={() => setShowLayers(false)}
+                className="w-6 h-6 flex items-center justify-center rounded-md hover:bg-black/5 text-secondary hover:text-primary transition-colors lg:hidden"
+              >
+                <X size={12} />
+              </button>
+            </div>
+            <div className="max-h-[calc(100vh-340px)] overflow-y-auto p-2 space-y-1">
+              {layerOrder.map((frag) => {
+                const isSelected = selectedId === frag.id;
+                const thumbSrc = blobUrls.current.get(frag.id);
+                return (
+                  <div
+                    key={frag.id}
+                    className={cn(
+                      "flex items-center gap-2 px-2 py-1.5 rounded-lg cursor-pointer transition-all text-xs group",
+                      isSelected
+                        ? "bg-accent/10 ring-1 ring-accent/20"
+                        : "hover:bg-black/[0.03]"
+                    )}
+                    onClick={() => setSelectedId(frag.id)}
+                  >
+                    <div
+                      className={cn(
+                        "w-8 h-8 rounded-md overflow-hidden flex-shrink-0 flex items-center justify-center",
+                        frag.visible ? "bg-neutral-100" : "bg-neutral-100/50"
+                      )}
+                    >
+                      {thumbSrc && (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          src={thumbSrc}
+                          alt=""
+                          className="w-full h-full object-contain"
+                          style={{ opacity: frag.visible ? 1 : 0.3 }}
+                          draggable={false}
+                        />
+                      )}
+                    </div>
+                    <span
+                      className={cn(
+                        "flex-1 font-medium tabular-nums",
+                        isSelected ? "text-accent" : "text-primary",
+                        !frag.visible && "text-secondary"
+                      )}
+                    >
+                      Fragment #{frag.id}
+                    </span>
+                    {isSelected && (
+                      <div className="flex flex-col -my-0.5">
+                        <button
+                          onClick={(e) => { e.stopPropagation(); moveLayerUp(frag.id); }}
+                          className="p-0.5 hover:bg-accent/10 rounded text-secondary hover:text-accent transition-colors"
+                          title="Move up"
+                        >
+                          <ChevronUp size={10} />
+                        </button>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); moveLayerDown(frag.id); }}
+                          className="p-0.5 hover:bg-accent/10 rounded text-secondary hover:text-accent transition-colors"
+                          title="Move down"
+                        >
+                          <ChevronDown size={10} />
+                        </button>
+                      </div>
+                    )}
+                    <button
+                      onClick={(e) => { e.stopPropagation(); toggleVisible(frag.id); }}
+                      className={cn(
+                        "p-1 rounded-md transition-colors",
+                        frag.visible
+                          ? "text-secondary hover:text-primary hover:bg-black/5"
+                          : "text-secondary/40 hover:text-secondary hover:bg-black/5"
+                      )}
+                      title={frag.visible ? "Hide" : "Show"}
+                    >
+                      {frag.visible ? <Eye size={12} /> : <EyeOff size={12} />}
+                    </button>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); toggleLock(frag.id); }}
+                      className={cn(
+                        "p-1 rounded-md transition-colors",
+                        frag.locked
+                          ? "text-warning hover:text-warning/80 hover:bg-warning/5"
+                          : "text-secondary/30 hover:text-secondary hover:bg-black/5"
+                      )}
+                      title={frag.locked ? "Unlock" : "Lock"}
+                    >
+                      {frag.locked ? <Lock size={12} /> : <Unlock size={12} />}
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </aside>
+
+        {/* ── Canvas area ─────────────────────────────────────────────── */}
+        <div
+          ref={containerRef}
+          className="relative w-full rounded-2xl overflow-hidden select-none"
+          style={{
+            height: "calc(100vh - 180px)",
+            minHeight: 520,
+            cursor: isPanning || scrollDrag
+              ? "grabbing"
+              : spaceHeld
+                ? "grab"
+                : dragState
+                  ? "grabbing"
+                  : "default",
+            background: "#1a1a1e",
+            backgroundImage: "radial-gradient(circle, rgba(255,255,255,0.03) 1px, transparent 1px)",
+            backgroundSize: "24px 24px",
+          }}
+          onMouseDown={handleCanvasMouseDown}
+          onMouseMove={handleMouseMove}
+          onMouseUp={handleMouseUp}
+          onMouseLeave={handleMouseUp}
+          onContextMenu={(e) => e.preventDefault()}
+        >
         {/* Loading overlay */}
         {!allLoaded && (
           <div className="absolute inset-0 bg-[#1a1a1e]/90 z-50 flex flex-col items-center justify-center gap-3">
@@ -1326,6 +1431,171 @@ export function AssemblyView({ jobId }: AssemblyViewProps) {
             />
           </div>
         )}
+      </div>
+
+        {/* ── Inspector sidebar ────────────────────────────────────────── */}
+        <aside className={cn("flex flex-col gap-3", showInspector ? "flex" : "hidden", "lg:flex")}
+          style={{ minHeight: 240 }}>
+          <div className="rounded-2xl border border-border/60 bg-white/90 shadow-card overflow-hidden">
+            <div className="flex items-center justify-between px-3 py-2 border-b border-border/50">
+              <span className="text-xs font-semibold text-primary">Инспектор</span>
+              <button
+                onClick={() => setShowInspector(false)}
+                className="w-6 h-6 flex items-center justify-center rounded-md hover:bg-black/5 text-secondary hover:text-primary transition-colors lg:hidden"
+              >
+                <X size={12} />
+              </button>
+            </div>
+            <div className="p-3 space-y-3">
+              {selectedFrag ? (
+                <>
+                  <div className="text-xs text-secondary">Фрагмент #{selectedFrag.id}</div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <label className="text-xs text-secondary">
+                      X
+                      <input
+                        type="number"
+                        className="mt-1 w-full rounded-md border border-border/60 px-2 py-1 text-xs text-primary"
+                        value={selectedFrag.x.toFixed(1)}
+                        onChange={(e) => updateSelected({ x: parseFloat(e.target.value) || 0 })}
+                      />
+                    </label>
+                    <label className="text-xs text-secondary">
+                      Y
+                      <input
+                        type="number"
+                        className="mt-1 w-full rounded-md border border-border/60 px-2 py-1 text-xs text-primary"
+                        value={selectedFrag.y.toFixed(1)}
+                        onChange={(e) => updateSelected({ y: parseFloat(e.target.value) || 0 })}
+                      />
+                    </label>
+                    <label className="text-xs text-secondary">
+                      Rotation
+                      <input
+                        type="number"
+                        className="mt-1 w-full rounded-md border border-border/60 px-2 py-1 text-xs text-primary"
+                        value={selectedFrag.rotation.toFixed(1)}
+                        onChange={(e) => updateSelected({ rotation: parseFloat(e.target.value) || 0 })}
+                      />
+                    </label>
+                    <div className="text-xs text-secondary">
+                      Size
+                      <div className="mt-1 rounded-md border border-border/60 px-2 py-1 text-xs text-primary">
+                        {selectedFrag.width}×{selectedFrag.height}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => toggleVisible(selectedFrag.id)}
+                    >
+                      {selectedFrag.visible ? <Eye size={14} /> : <EyeOff size={14} />}
+                      {selectedFrag.visible ? "Скрыть" : "Показать"}
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => toggleLock(selectedFrag.id)}
+                    >
+                      {selectedFrag.locked ? <Lock size={14} /> : <Unlock size={14} />}
+                      {selectedFrag.locked ? "Разблок." : "Блокировать"}
+                    </Button>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Button variant="outline" size="sm" onClick={() => moveLayerUp(selectedFrag.id)}>
+                      <ChevronUp size={14} />
+                      Вверх
+                    </Button>
+                    <Button variant="outline" size="sm" onClick={() => moveLayerDown(selectedFrag.id)}>
+                      <ChevronDown size={14} />
+                      Вниз
+                    </Button>
+                  </div>
+                </>
+              ) : (
+                <div className="text-xs text-secondary">Выберите фрагмент на холсте.</div>
+              )}
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-border/60 bg-white/90 shadow-card overflow-hidden">
+            <div className="flex items-center justify-between px-3 py-2 border-b border-border/50">
+              <span className="text-xs font-semibold text-primary">Экспорт</span>
+              <button
+                onClick={() => setShowAdvanced((v) => !v)}
+                className="w-6 h-6 flex items-center justify-center rounded-md hover:bg-black/5 text-secondary hover:text-primary transition-colors"
+                title="Дополнительные параметры"
+              >
+                {showAdvanced ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+              </button>
+            </div>
+            <div className="p-3 space-y-3">
+              <div className="flex items-center gap-1 bg-muted rounded-lg p-0.5 w-fit">
+                {[1, 2, 4].map((s) => (
+                  <button
+                    key={s}
+                    onClick={() => setExportScale(s)}
+                    className={cn(
+                      "px-2 py-1 text-[11px] font-medium rounded-md transition-all",
+                      exportScale === s
+                        ? "bg-white text-primary shadow-sm"
+                        : "text-secondary hover:text-primary"
+                    )}
+                  >
+                    {s}x
+                  </button>
+                ))}
+              </div>
+              <label className="flex items-start gap-2 text-xs text-secondary">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={showRaw}
+                  onChange={(e) => setShowRaw(e.target.checked)}
+                />
+                Экспорт без LaMa (сырой результат)
+              </label>
+              {showAdvanced && (
+                <label className={cn(
+                  "flex items-start gap-2 text-xs text-secondary",
+                  showRaw && "opacity-40 pointer-events-none"
+                )}>
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
+                    checked={refine}
+                    onChange={(e) => setRefine(e.target.checked)}
+                    disabled={showRaw}
+                  />
+                  Refinement LaMa (высокое качество, медленно)
+                </label>
+              )}
+              <Button
+                variant="default"
+                size="sm"
+                onClick={handleExport}
+                disabled={exporting}
+                className="w-full"
+              >
+                {exporting ? (
+                  <Loader size={14} className="animate-spin" />
+                ) : (
+                  <Download size={14} />
+                )}
+                {exporting ? "Экспорт..." : "Скачать"}
+              </Button>
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-border/60 bg-white/90 shadow-card p-3 text-xs text-secondary space-y-2">
+            <div className="font-semibold text-primary">Подсказки</div>
+            <div>Перетащите фрагмент — перемещение.</div>
+            <div>ПКМ и перетаскивание — поворот.</div>
+            <div>Колёсико — масштаб, Space — панорама.</div>
+          </div>
+        </aside>
       </div>
 
       {/* ── Footer ──────────────────────────────────────────────────────── */}

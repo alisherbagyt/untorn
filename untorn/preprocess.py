@@ -14,16 +14,12 @@ import numpy as np
 import cv2
 from pathlib import Path
 
+from . import config as cfg
 from .io_utils import save_image
 
 
-# Maximum dimension (longest side) for the working image.
-# 1500px keeps SAM 2.1 comfortable on 4GB VRAM with points_per_side=32.
-WORKING_MAX_DIM = 1500
-
-
 def prepare_image(image_rgb: np.ndarray, debug_dir: Path,
-                  max_dim: int = WORKING_MAX_DIM) -> dict:
+                  max_dim: int | None = None) -> dict:
     """
     Prepare working and full-resolution images.
 
@@ -37,6 +33,9 @@ def prepare_image(image_rgb: np.ndarray, debug_dir: Path,
             - scale_factor:  full / work ratio (float, >= 1.0)
             - full_h, full_w, work_h, work_w: dimensions
     """
+    if max_dim is None:
+        max_dim = int(getattr(cfg, "WORKING_MAX_DIM", 1500))
+
     prep_debug = debug_dir / "preprocess"
     prep_debug.mkdir(parents=True, exist_ok=True)
 

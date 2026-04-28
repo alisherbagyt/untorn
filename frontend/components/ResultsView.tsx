@@ -10,6 +10,7 @@ import { ContoursView }       from "@/components/views/ContoursView";
 import { ReconstructionView } from "@/components/views/ReconstructionView";
 import { CompositionView }    from "@/components/views/CompositionView";
 import { AssemblyView }       from "@/components/views/AssemblyView";
+import { Badge } from "@/components/ui/badge";
 
 type Tab = "overview" | "segmentation" | "contours" | "reconstruction" | "composition" | "assembly";
 
@@ -118,6 +119,17 @@ export function ResultsView({ jobId, onReset }: ResultsViewProps) {
               {debug.pipeline_meta.n_fragments} фрагментов · {debug.pipeline_meta.timings.total}с всего
             </p>
           )}
+          <div className="flex flex-wrap gap-2 mt-2">
+            {debug.pipeline_meta?.edge_matcher_loaded && (
+              <Badge variant="info">Siamese gate активен</Badge>
+            )}
+            {debug.inpainting?.status === "OK" && (
+              <Badge variant="success">LaMa очистка</Badge>
+            )}
+            {debug.inpainting?.status === "SKIPPED_NO_MODEL" && (
+              <Badge variant="warning">LaMa недоступна</Badge>
+            )}
+          </div>
         </div>
         <button
           onClick={onReset}
@@ -128,13 +140,13 @@ export function ResultsView({ jobId, onReset }: ResultsViewProps) {
       </div>
 
       {/* Navigation pills */}
-      <div className="flex gap-1 mb-6 bg-muted rounded-2xl p-1 w-fit">
+      <div className="flex gap-1 mb-6 bg-muted rounded-2xl p-1 w-fit max-w-full overflow-x-auto no-scrollbar">
         {TABS.map((t) => (
           <button
             key={t.key}
             onClick={() => setTab(t.key)}
             className={cn(
-              "px-4 py-2 text-sm font-medium rounded-xl transition-all duration-150",
+              "px-4 py-2 text-sm font-medium rounded-xl transition-all duration-150 whitespace-nowrap",
               tab === t.key
                 ? "bg-white text-primary shadow-card"
                 : "text-secondary hover:text-primary"
@@ -158,7 +170,15 @@ export function ResultsView({ jobId, onReset }: ResultsViewProps) {
 
       {/* Assembly view: mounted once, hidden when not active */}
       {assemblyMounted && (
-        <div style={{ display: tab === "assembly" ? "block" : "none" }}>
+        <div
+          style={{ display: tab === "assembly" ? "block" : "none" }}
+          className={cn(
+            "transition-all",
+            tab === "assembly"
+              ? "relative left-1/2 right-1/2 -ml-[50vw] -mr-[50vw] w-screen px-4"
+              : ""
+          )}
+        >
           <AssemblyView jobId={jobId} />
         </div>
       )}

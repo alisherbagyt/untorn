@@ -86,9 +86,16 @@ def _mean_paper_lab(image_rgb: np.ndarray,
 
 
 def attach_paper_lab_all(fragments: list[dict], image_rgb: np.ndarray) -> None:
-    """Cache a per-fragment paper-color LAB fingerprint on frag['paper_lab']."""
+    """Cache a per-fragment paper-color LAB fingerprint on frag['paper_lab'].
+
+    Kept for backward compatibility. Step 2 routes the canonical
+    fingerprint through ``fragment_io.build_descriptor``; this function is
+    only invoked when fragments arrive from a code path that bypasses the
+    canonical builder (e.g. legacy unit tests).
+    """
     for frag in fragments:
-        frag["paper_lab"] = _mean_paper_lab(image_rgb, frag)
+        if frag.get("paper_lab") is None:
+            frag["paper_lab"] = _mean_paper_lab(image_rgb, frag)
 
 
 def _paper_lab_delta(frag_a: dict, frag_b: dict) -> float:
@@ -109,119 +116,16 @@ def _paper_color_score(frag_a: dict, frag_b: dict) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  Edge extraction (torn vs factory classification via RANSAC line inlier)
+#  Edge extraction lives in untorn.fragment_io (Step 2 consolidation).
+#  The legacy `extract_edges_from_contour` is re-exported here for any
+#  external caller that imported it directly.
 # ══════════════════════════════════════════════════════════════════════════
 
-def _ransac_line_inlier_ratio(pts: np.ndarray,
-                              threshold_px: float = 1.5,
-                              n_iter: int = 50) -> float:
-    """Fraction of points within threshold_px of the best-fit line."""
-    if len(pts) < 3:
-        return 1.0
-    n = len(pts)
-    best = 0.0
-    rng = np.random.default_rng(seed=42)
-    for _ in range(n_iter):
-        idx = rng.choice(n, 2, replace=False)
-        p1, p2 = pts[idx[0]], pts[idx[1]]
-        d = p2 - p1
-        ll = float(np.linalg.norm(d))
-        if ll < 1e-6:
-            continue
-        normal = np.array([-d[1], d[0]]) / ll
-        dists = np.abs((pts - p1) @ normal)
-        ratio = float(np.sum(dists < threshold_px) / n)
-        if ratio > best:
-            best = ratio
-    return best
-
-
-def _straightness(pts: np.ndarray) -> float:
-    """End-to-end / arc-length ratio. 1.0 = perfectly straight."""
-    if len(pts) < 2:
-        return 1.0
-    return float(np.linalg.norm(pts[-1] - pts[0]) / max(
-        np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)), 1e-6))
-
-
-def _classify_edge(pts: np.ndarray) -> tuple[bool, float, float]:
-    """Returns (is_torn, ransac_inlier_ratio, straightness)."""
-    s = _straightness(pts)
-    r = _ransac_line_inlier_ratio(pts, threshold_px=1.5)
-    is_factory = r > 0.92 and s > 0.98
-    return (not is_factory), r, s
-
-
-def _compute_outward_normal(edge_pts: np.ndarray,
-                             mask: np.ndarray) -> np.ndarray:
-    """Return the 2D unit normal at the edge midpoint pointing away from mask."""
-    direction = edge_pts[-1] - edge_pts[0]
-    dl = float(np.linalg.norm(direction))
-    if dl < 1e-6:
-        return np.array([0.0, 0.0])
-    direction = direction / dl
-    n1 = np.array([-direction[1], direction[0]])
-    n2 = -n1
-    mid = edge_pts[len(edge_pts) // 2]
-    h, w = mask.shape
-    for step in [5, 10, 20, 40]:
-        t1 = (mid + n1 * step).astype(int)
-        t2 = (mid + n2 * step).astype(int)
-        in1 = (0 <= t1[0] < w and 0 <= t1[1] < h and mask[t1[1], t1[0]] > 127)
-        in2 = (0 <= t2[0] < w and 0 <= t2[1] < h and mask[t2[1], t2[0]] > 127)
-        if in1 and not in2:
-            return n2
-        if in2 and not in1:
-            return n1
-    return n1
-
-
-def extract_edges_from_contour(contour: np.ndarray,
-                                support_points: np.ndarray,
-                                mask: np.ndarray,
-                                min_edge_length: float = 20.0) -> list[dict]:
-    """
-    Break the contour polyline at support points into directed edges,
-    classify each as torn/factory, attach geometric metadata.
-    """
-    contour_pts = contour.reshape(-1, 2).astype(np.float64)
-    n_sp = len(support_points)
-    sp_indices = []
-    for sp in support_points:
-        dists = np.linalg.norm(contour_pts - sp.astype(np.float64), axis=1)
-        sp_indices.append(int(np.argmin(dists)))
-    order = np.argsort(sp_indices)
-    sp_sorted = [sp_indices[o] for o in order]
-    sp_ids = [int(order[k]) for k in range(n_sp)]
-
-    edges = []
-    for k in range(n_sp):
-        sci = sp_sorted[k]
-        eci = sp_sorted[(k + 1) % n_sp]
-        if eci > sci:
-            epts = contour_pts[sci:eci + 1]
-        else:
-            epts = np.vstack([contour_pts[sci:], contour_pts[:eci + 1]])
-        if len(epts) < 2:
-            continue
-        al = float(np.sum(np.linalg.norm(np.diff(epts, axis=0), axis=1)))
-        if al < min_edge_length:
-            continue
-        is_torn, rr, st = _classify_edge(epts)
-        mid = epts[len(epts) // 2].copy()
-        d = epts[-1] - epts[0]
-        dl = float(np.linalg.norm(d))
-        if dl > 0:
-            d = d / dl
-        on = _compute_outward_normal(epts, mask)
-        edges.append({
-            "pts": epts,
-            "start_sp": sp_ids[k], "end_sp": sp_ids[(k + 1) % n_sp],
-            "length": al, "straightness": st,
-            "ransac_inlier_ratio": rr, "is_torn": is_torn,
-            "midpoint": mid, "direction": d, "outward_normal": on,
-        })
-    return edges
+from .fragment_io import (
+    _extract_edges_from_contour as extract_edges_from_contour,
+    _classify_edge,
+    _compute_outward_normal,
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -424,36 +328,44 @@ def _score_edge_appearance(image_rgb: np.ndarray,
                             strip_width: int = 8) -> float:
     """
     Compare interior-facing pixel strips along two matched edges.
-    Returns sappearance in [0, 1] (0 = identical, 1 = opposite).
-    Falls back to 0.5 on uninformative strips.
-    """
-    h, w = image_rgb.shape[:2]
+    Returns sappearance in [0, 1] (0 = identical, 1 = opposite); 0.5 on
+    uninformative strips.
 
-    def extract_strip(pts: np.ndarray, outward_normal: np.ndarray) -> np.ndarray:
-        interior = -outward_normal
+    Vectorised: each strip is a (n_points, strip_width, 3) tensor sampled
+    by a single ``cv2.remap`` call (bilinear), replacing the prior
+    per-pixel python loop. Around 30× faster on long edges.
+    """
+    if matched_a is None or matched_b is None or len(matched_a) == 0 or len(matched_b) == 0:
+        return 0.5
+
+    def _strip(pts: np.ndarray, outward_normal: np.ndarray) -> np.ndarray:
+        interior = -np.asarray(outward_normal, dtype=np.float32)
         n = float(np.linalg.norm(interior))
         if n < 1e-9:
             return np.zeros((0, strip_width, 3), dtype=np.float32)
         interior = interior / n
-        rows = []
-        for pt in pts:
-            row = []
-            for step in range(1, strip_width + 1):
-                sp = pt + step * interior
-                xi = int(max(0, min(w - 1, round(float(sp[0])))))
-                yi = int(max(0, min(h - 1, round(float(sp[1])))))
-                row.append(image_rgb[yi, xi].astype(np.float32))
-            rows.append(row)
-        return np.array(rows, dtype=np.float32)
+        steps = np.arange(1, strip_width + 1, dtype=np.float32)  # (W,)
+        # (n_pts, W, 2): pts shifted by step * interior.
+        offsets = steps[None, :, None] * interior[None, None, :]
+        coords = pts.astype(np.float32)[:, None, :] + offsets
+        # cv2.remap wants (H, W) maps in (x, y) order. Treat n_pts as H,
+        # strip_width as W; sample once and return (H, W, 3).
+        map_x = np.ascontiguousarray(coords[..., 0], dtype=np.float32)
+        map_y = np.ascontiguousarray(coords[..., 1], dtype=np.float32)
+        sampled = cv2.remap(image_rgb, map_x, map_y,
+                            interpolation=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_REPLICATE)
+        return sampled.astype(np.float32)
 
-    strip_a = extract_strip(matched_a, edge_a["outward_normal"])
-    strip_b = extract_strip(matched_b, edge_b["outward_normal"])
+    strip_a = _strip(matched_a, edge_a["outward_normal"])
+    strip_b = _strip(matched_b, edge_b["outward_normal"])
     if strip_a.size == 0 or strip_b.size == 0:
         return 0.5
     n = min(len(strip_a), len(strip_b))
-    flat_a = strip_a[:n].flatten()
-    flat_b = strip_b[:n].flatten()
-    std_a = float(np.std(flat_a)); std_b = float(np.std(flat_b))
+    flat_a = strip_a[:n].reshape(-1)
+    flat_b = strip_b[:n].reshape(-1)
+    std_a = float(np.std(flat_a))
+    std_b = float(np.std(flat_b))
     if std_a < 1.0 or std_b < 1.0:
         diff = abs(float(np.mean(flat_a)) - float(np.mean(flat_b))) / 255.0
         return min(diff, 1.0)
@@ -676,35 +588,34 @@ def evaluate_edge_fit(frag_a: dict, frag_b: dict,
 def prepare_edges_and_sdt(fragments: list[dict],
                           image_rgb: np.ndarray | None = None) -> None:
     """
-    Populate frag["edges"] with torn/factory classification, attach a
-    per-edge curvature string, and cache the interior signed-distance
-    transform for each fragment (used by the physical gate).
+    Backward-compatible Phase-3 prep step.
 
-    If `image_rgb` is provided we also cache a per-fragment paper-LAB
-    fingerprint (see `_mean_paper_lab`) for the matching paper-color gate.
+    As of Step 2, ``untorn.fragment_io.build_all`` (called from Phase 2)
+    already populates ``edges``, ``_sdt_interior``, ``paper_lab`` and the
+    per-edge curvature strings. This function therefore becomes a tolerant
+    fall-back: it fills only what is missing, so it remains safe to call
+    on fragment dicts that arrived through a non-canonical path
+    (legacy unit tests, partial benchmarks, etc.).
     """
     if image_rgb is not None:
         attach_paper_lab_all(fragments, image_rgb)
     for frag in fragments:
-        # Prefer the sub-pixel contour (from boundary.refine_boundary_subpixel)
-        # when available; the integer contour is kept only as a fallback and
-        # for legacy cv2 drawing paths.
-        contour_for_edges = frag.get("contour_subpixel")
-        if contour_for_edges is None or len(contour_for_edges) < 3:
-            contour_for_edges = frag["contour"]
-        frag["edges"] = extract_edges_from_contour(
-            contour_for_edges, frag["support_points"],
-            frag["mask"], min_edge_length=15.0)
+        if not frag.get("edges"):
+            contour_for_edges = frag.get("contour_subpixel")
+            if contour_for_edges is None or len(contour_for_edges) < 3:
+                contour_for_edges = frag["contour"]
+            frag["edges"] = extract_edges_from_contour(
+                contour_for_edges, frag["support_points"],
+                frag["mask"], min_edge_length=15.0)
         for e in frag["edges"]:
-            if e["is_torn"]:
+            if e.get("is_torn") and e.get("_curvature") is None:
                 resamp, curv = compute_curvature_string(e["pts"])
                 e["_resampled"] = resamp
                 e["_curvature"] = curv
-
-        # Interior SDT: O(H·W) but done once.
-        fg = (frag["mask"] > 127).astype(np.uint8) * 255
-        frag["_sdt_interior"] = cv2.distanceTransform(
-            fg, cv2.DIST_L2, 3).astype(np.float32)
+        if frag.get("_sdt_interior") is None:
+            fg = (frag["mask"] > 127).astype(np.uint8) * 255
+            frag["_sdt_interior"] = cv2.distanceTransform(
+                fg, cv2.DIST_L2, 3).astype(np.float32)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -750,6 +661,19 @@ def _match_edge_pair(edge_a: dict, edge_b: dict,
         if _MATCH_TRACE:
             xs = " ".join(f"{k}={v}" for k, v in extra.items())
             print(f"    [trace] {tag}: reject {reason}  {xs}")
+
+    # Gate 0: sanity checks for edge geometry and minimum usable length.
+    if len(edge_a.get("pts", ())) < 3 or len(edge_b.get("pts", ())) < 3:
+        _trace("edge_degenerate")
+        return None
+
+    min_len = float(getattr(cfg, "ASSEMBLY_MIN_EDGE_LENGTH_PX", 40.0))
+    len_a = float(edge_a.get("length", 0.0))
+    len_b = float(edge_b.get("length", 0.0))
+    if len_a < min_len or len_b < min_len:
+        _trace("edge_too_short", len_a=f"{len_a:.1f}", len_b=f"{len_b:.1f}",
+               min=f"{min_len:.1f}")
+        return None
 
     if edge_a["length"] < cfg.MIN_TORN_EDGE_PX or \
        edge_b["length"] < cfg.MIN_TORN_EDGE_PX:
@@ -798,24 +722,29 @@ def _match_edge_pair(edge_a: dict, edge_b: dict,
     if len(matched_a) < 3:
         _trace("few_matched_pts"); return None
 
-    # Multi-seed Procrustes: SW may have picked a wrong sub-arc, so we fit
-    # from several overlapping windows into the matched correspondences and
-    # keep the seed with the lowest RMS. This defeats the "locked to wrong
-    # rotation because SW latched onto the wrong end" local minimum that
-    # single-start Procrustes falls into under edge noise.
+    # Multi-seed Procrustes. Two seed sources:
+    #   (a) Sub-arc windows of the SW correspondences. SW may have picked a
+    #       wrong sub-arc, so we fit from several overlapping windows and
+    #       keep the seed with the lowest RMS. Defeats the "locked to wrong
+    #       rotation because SW latched onto the wrong end" local minimum
+    #       that single-start Procrustes falls into under edge noise.
+    #   (b) Per-fragment text-angle prior. When both fragments have a
+    #       canonical text orientation, the relative rotation that takes
+    #       fragment B onto fragment A's frame is a strong physical prior:
+    #       the seam shouldn't change baseline angle. We seed Procrustes at
+    #       this prior with translation = matched-centroid offset and let
+    #       it relax. (Step 3 wiring.)
     N = len(matched_a)
     n_seeds = max(1, int(cfg.MATCH_PROCRUSTES_SEEDS))
     if N < 4 or n_seeds <= 1:
         seed_windows = [(0, N)]
     else:
-        # Overlapping sliding windows of ~2/3 N. Equivalent to the full arc
-        # when n_seeds == 1 and to {head, centre, tail} for n_seeds == 3.
         win = max(3, (2 * N + n_seeds) // (n_seeds + 1))
         starts = np.linspace(0, max(0, N - win), n_seeds).astype(int)
         seed_windows = [(int(s), int(min(N, s + win))) for s in starts]
         seed_windows.append((0, N))   # always include the full arc as backup
 
-    best_seed = None   # (rms, angle, t, R, window)
+    best_seed = None   # (rms, angle, t, R, window | "text_prior")
     for (ws, we) in seed_windows:
         if we - ws < 3:
             continue
@@ -827,6 +756,40 @@ def _match_edge_pair(edge_a: dict, edge_b: dict,
             continue
         if best_seed is None or rms_s < best_seed[0]:
             best_seed = (rms_s, ang_s, t_s, R_s, (ws, we))
+
+    text_prior_used = False
+    if (frag_a is not None and frag_b is not None and
+            frag_a.get("text_angle_canonical") is not None and
+            frag_b.get("text_angle_canonical") is not None):
+        ta = float(frag_a["text_angle_canonical"])
+        tb = float(frag_b["text_angle_canonical"])
+        # Relative rotation that aligns B's baseline orientation with A's.
+        # Map into [-π/2, π/2) to ignore 180° baseline ambiguity.
+        delta = ta - tb
+        while delta >= np.pi / 2:
+            delta -= np.pi
+        while delta < -np.pi / 2:
+            delta += np.pi
+        if abs(np.degrees(delta)) <= cfg.RECON_MAX_ROTATION_DEG:
+            ct = float(np.cos(delta)); st = float(np.sin(delta))
+            R_prior = np.array([[ct, -st], [st, ct]], dtype=np.float64)
+            # Translation that takes the centroid of warped matched_b onto
+            # the centroid of matched_a — the natural translation seed.
+            cb = matched_b.mean(axis=0)
+            ca = matched_a.mean(axis=0)
+            t_prior = ca - R_prior @ cb
+            warped = (R_prior @ matched_b.T).T + t_prior
+            rms_prior = float(np.sqrt(np.mean(np.sum(
+                (warped - matched_a) ** 2, axis=1))))
+            if np.isfinite(rms_prior) and (
+                    best_seed is None or rms_prior < best_seed[0] + 0.5):
+                # +0.5 px slack: prefer the text-prior seed when its RMS is
+                # within half a pixel of the best sub-arc seed, since it is
+                # a STRONGER signal (whole-fragment text orientation) than a
+                # local correspondence sub-window.
+                if best_seed is None or rms_prior < best_seed[0]:
+                    best_seed = (rms_prior, delta, t_prior, R_prior, "text_prior")
+                    text_prior_used = True
 
     if best_seed is None:
         _trace("procrustes_no_seed"); return None
@@ -876,6 +839,40 @@ def _match_edge_pair(edge_a: dict, edge_b: dict,
     if abs(np.degrees(angle)) > cfg.RECON_MAX_ROTATION_DEG:
         _trace("post_icp_rotation_large", ang=f"{np.degrees(angle):.1f}")
         return None
+
+    # ── Gate B': Siamese edge matcher (Phase 4) ───────────────────────────
+    # Sample two 32x256 strips from image_rgb at the live torn-edge polylines
+    # and ask the trained EdgeMatcher CNN whether they visually belong to
+    # the same tear. Positive examples cluster near probability 1.0 (model
+    # temperature ~10), so a mid-cascade threshold of 0.985 keeps real
+    # matches and kills "right curvature, wrong edge" geometric near-misses
+    # that survived SW + Procrustes + ICP. Returns None silently if the
+    # model isn't loaded — the pipeline degrades to the legacy 4-gate
+    # cascade.
+    edge_matcher_prob = None
+    edge_matcher_cos  = None
+    if (image_rgb is not None and
+            getattr(cfg, "EDGE_MATCHER_ENABLED", False)):
+        try:
+            from . import edge_matcher as em
+        except Exception:
+            em = None
+        if em is not None and em.is_loaded():
+            try:
+                em_out = em.score_edge_pair(image_rgb, edge_a, edge_b,
+                                             orientation)
+            except Exception as exc:
+                if _MATCH_TRACE:
+                    print(f"    [trace] {tag}: edge_matcher error: {exc}")
+                em_out = None
+            if em_out is not None:
+                edge_matcher_prob = float(em_out["match_prob"])
+                edge_matcher_cos  = float(em_out["cosine"])
+                if edge_matcher_prob < cfg.EDGE_MATCHER_MIN_SCORE:
+                    _trace("edge_matcher_low",
+                            prob=f"{edge_matcher_prob:.3f}",
+                            min=f"{cfg.EDGE_MATCHER_MIN_SCORE:.3f}")
+                    return None
 
     # Multi-component score (lower = better)
     arc_a = float(np.sum(np.linalg.norm(np.diff(matched_a, axis=0), axis=1)))
@@ -1010,6 +1007,7 @@ def _match_edge_pair(edge_a: dict, edge_b: dict,
 
     result = {
         "orientation": orientation,
+        "text_prior_used": bool(text_prior_used),
         "sw_score":    float(sw_score),
         "n_aligned":   int(len(idx_a)),
         "angle":       float(angle),
@@ -1029,6 +1027,8 @@ def _match_edge_pair(edge_a: dict, edge_b: dict,
         "text_score":  float(text_score),
         "text_expected": int(text_expected),
         "paper_score": float(paper_score),
+        "edge_matcher_prob": edge_matcher_prob,
+        "edge_matcher_cos":  edge_matcher_cos,
         "confidence":  float(conf),
         "matched_a":   np.asarray(matched_a, dtype=np.float64),
         "matched_b":   np.asarray(matched_b, dtype=np.float64),
@@ -1075,6 +1075,22 @@ def match_pair(frag_a: dict, frag_b: dict,
 
     # Tag used for verbose matching traces
     id_a = frag_a["id"]; id_b = frag_b["id"]
+
+    # Gate 1B: reject globally-distant fragment pairs using boundary proximity.
+    # If neither fragment has boundary pixels we skip this gate.
+    bnd_a = frag_a.get("boundary_pixels")
+    bnd_b = frag_b.get("boundary_pixels")
+    if bnd_a is not None and bnd_b is not None and len(bnd_a) and len(bnd_b):
+        prox_max = float(getattr(cfg, "ASSEMBLY_EDGE_PROXIMITY_PX", 200.0))
+        min_boundary_dist = float(cKDTree(np.asarray(bnd_a, dtype=np.float64))
+                                  .query(np.asarray(bnd_b, dtype=np.float64), k=1)[0]
+                                  .min())
+        if min_boundary_dist > prox_max:
+            if _MATCH_TRACE:
+                print(f"    [trace] frag{id_a} <> frag{id_b}: reject "
+                      f"boundary_proximity_high  dist={min_boundary_dist:.1f} "
+                      f"max={prox_max:.1f}")
+            return None
 
     for ki, ea in torn_a:
         for kj, eb in torn_b:

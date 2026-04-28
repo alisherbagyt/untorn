@@ -20,6 +20,8 @@ export function phaseLabel(phase: string): string {
     contours:       "Анализ контуров",
     reconstruction: "Реконструкция",
     composition:    "Компоновка",
+    gap_fill:       "Заполнение пропусков",
+    inpainting:     "Заполнение пропусков",
     done:           "Завершено",
     error:          "Ошибка",
   };
@@ -34,6 +36,8 @@ export function phaseColor(phase: string): string {
     contours:       "text-purple-500",
     reconstruction: "text-orange-500",
     composition:    "text-green-500",
+    gap_fill:       "text-emerald-500",
+    inpainting:     "text-emerald-500",
     done:           "text-success",
     error:          "text-danger",
   };
@@ -46,15 +50,19 @@ function _backendHost(): string {
 }
 
 export function getApiBase(): string {
+  const envBase = process.env.NEXT_PUBLIC_API_BASE?.trim();
+  if (envBase) return envBase.replace(/\/$/, "");
   return `http://${_backendHost()}:8000`;
 }
 
 export function getWsBase(): string {
+  const envBase = process.env.NEXT_PUBLIC_WS_BASE?.trim();
+  if (envBase) return envBase.replace(/\/$/, "");
   return `ws://${_backendHost()}:8000`;
 }
 
-export const API_BASE = "http://localhost:8000";
-export const WS_BASE  = "ws://localhost:8000";
+export const API_BASE = process.env.NEXT_PUBLIC_API_BASE?.trim() || "http://localhost:8000";
+export const WS_BASE  = process.env.NEXT_PUBLIC_WS_BASE?.trim() || "ws://localhost:8000";
 
 export function debugImageUrl(path: string): string {
   return `${getApiBase()}${path}`;

@@ -40,6 +40,12 @@ INPUT_DIR    = DATA_DIR / "input"
 OUTPUT_DIR   = DATA_DIR / "output"
 DEBUG_DIR    = DATA_DIR / "debug"
 
+# ─── Working resolution ────────────────────────────────────────────────────
+# Phase 0 downscales any input whose longer side exceeds this. 1500 px keeps
+# SAM 2.1 comfortable on 4 GB VRAM at points_per_side=32. Lift to 2000 if
+# you have ≥ 6 GB and need more detail; the rest of the pipeline scales.
+WORKING_MAX_DIM = 1500
+
 # ─── SAM 2.1 ───────────────────────────────────────────────────────────────
 
 SAM2_REPO_DIR   = str(PROJECT_ROOT / "sam2")
@@ -175,27 +181,165 @@ CONFIDENCE_STOTAL_SPAN      = 2.5
 # global text-line rotation to keep text horizontal.
 
 ASSEMBLY_HIGH_CONFIDENCE_LOCK   = 0.92   # auto-lock (no overlap re-check if seen)
-ASSEMBLY_MIN_CONFIDENCE         = 0.55   # threshold to enter the MST queue
-ASSEMBLY_ORPHAN_MIN_CONFIDENCE  = 0.45   # relaxed bar for last-resort pass
-ASSEMBLY_GLOBAL_ROT_FIX_EVERY   = 5      # apply text-line rotation every N attach
-ASSEMBLY_GLOBAL_ROT_MIN_LINES   = 3      # need at least this many placed baselines
-ASSEMBLY_GLOBAL_ROT_MIN_DEG     = 0.5    # only apply if misalignment exceeds this
-ASSEMBLY_EDGE_LENGTH_RATIO_MAX  = 3.0    # drop candidates whose edges differ by >3x
+ASSEMBLY_MIN_CONFIDENCE         = 0.45   # threshold to enter the MST queue
+                                          # (relaxed from 0.55 - the four-gate
+                                          # cascade already drops bad pairs;
+                                          # too-strict floor was causing 10/12
+                                          # fragments to be left unplaced).
+ASSEMBLY_ORPHAN_MIN_CONFIDENCE  = 0.40   # relaxed bar for the standard rescue pass
+# NOTE: ASSEMBLY_GLOBAL_ROT_FIX_EVERY, ASSEMBLY_GLOBAL_ROT_MIN_LINES,
+# ASSEMBLY_GLOBAL_ROT_MIN_DEG and ASSEMBLY_TEXT_ROTATION_MIN_DEG were removed
+# in Step 3 along with the cosmetic post-placement rotation passes. The
+# matcher now folds per-fragment text orientation into Procrustes seeding
+# (see matching._match_edge_pair "text_prior_used"); no global rotation
+# correction is needed because per-fragment alignment is correct by
+# construction.
+
+# Localized edge-connection filtering
+ASSEMBLY_EDGE_PROXIMITY_PX      = 200.0  # local boundary-distance gate for pair viability
+ASSEMBLY_MIN_EDGE_LENGTH_PX     = 40.0   # reject very short torn-edge pairings
+ASSEMBLY_MAX_EDGE_LENGTH_RATIO  = 2.5    # drop candidates whose edges differ by >2.5x
+ASSEMBLY_EDGE_LENGTH_RATIO_MAX  = ASSEMBLY_MAX_EDGE_LENGTH_RATIO  # backward-compatible alias
 ASSEMBLY_MAX_CANDIDATE_PAIRS    = 4000   # safety cap on scored pairs
 ASSEMBLY_MAX_STEPS              = 1024   # safety cap on MST growth steps
 
-# ─── Composition (Phase 4) ─────────────────────────────────────────────────
-# The new composition pipeline warps each fragment at `COMP_SUPERSAMPLE`x
-# the output resolution with bilinear interpolation (so sub-pixel pose
-# errors anti-alias instead of manifesting as a white seam), composes
-# with a feathered alpha rather than a hard pixel assignment, and applies
-# per-fragment LAB color harmonisation so all fragments share the same
-# paper mean. Ink is detected by luminance and its color shift is
-# attenuated so text doesn't drift.
+# Ensure every fragment has at least this many candidate partners scored.
+# The per-fragment prefilter (paper-LAB + edge length + grid filter) is too
+# aggressive on real-world degraded scans and can leave a fragment with
+# zero candidates - in which case it never enters the MST. When the total
+# survivor count is below this density floor, assembly falls back to "all
+# torn-edge pairs" so every fragment gets a fair shot at the matcher.
+ASSEMBLY_MIN_CANDIDATES_PER_FRAG = 3.0
+
+# Mutual-rank seed selection: an edge pair where both sides rank each other
+# in the top K is treated as a "mutually best" match - the strongest signal
+# we have that the seam is real. The MST seeder prefers these over
+# absolute-confidence top picks; the MST grower rewards them with a
+# +0.20 confidence bonus during conflict resolution.
+ASSEMBLY_MUTUAL_TOP_K           = 3
+
+# Aggressive orphan rescue: after the standard rescue pass, force a match
+# attempt between every (orphan, anchor) and every (orphan, orphan) pair
+# - even those the prefilter dropped - and accept the lowest-cost fit.
+# This is the "leave no fragment behind" pass and is what catches
+# fragments whose true partner sat below the candidate prefilter.
+ASSEMBLY_AGGRESSIVE_ORPHAN_RESCUE = True
+ORPHAN_RESCUE_MIN_CONFIDENCE      = 0.30   # bar for the aggressive pass
+ORPHAN_RESCUE_MAX_COST            = 1200.0 # per-pair fit_cost ceiling
+
+# Cluster reconciliation: the aggressive orphan rescue can leave the
+# canvas split into multiple disconnected clusters (each anchored at its
+# own scan-position identity). The reconciliation phase identifies them
+# via the merge_log and tries to bridge any pair of clusters using the
+# lowest-cost cached cross-cluster match. The full second cluster is
+# then SHIFTED rigidly so the bridge is satisfied.
+ASSEMBLY_CLUSTER_RECONCILE        = False
+CLUSTER_MERGE_MAX_COST            = 1500.0 # per-bridge fit_cost ceiling
+CLUSTER_MERGE_MAX_SHIFT_PX        = 4000.0 # absurd-shift safety guard
+# When two clusters merge they share a seam, so some seam-zone mask
+# overlap is expected. The MST overlap threshold (RECON_OVERLAP_THRESH)
+# is too strict here - we relax it by this factor for cluster bridges.
+# 6.0 -> ~50% allowed; the bridge fit_cost filter is the primary gate
+# at the cluster-reconciliation stage, not pixel overlap.
+CLUSTER_MERGE_OVERLAP_RELAX       = 6.0
+
+# Connection-line ("seam") gates applied at attach-time. The matcher can
+# return a (R, t) whose SW correspondences locally agree but whose full-
+# length seam either gaps wide, overlaps too much, or only covers a small
+# sub-arc of the actual edge. These gates kill those before they pollute
+# the MST. Loose enough that real (sub-pixel) drifts stay accepted; tight
+# enough that "right curvature, wrong edge" near-misses are rejected.
+SEAM_MAX_GAP_PX                 = 3.0    # mean nearest-neighbour gap across
+                                          # the seam. Tightened from 6.0 in
+                                          # Step 4 because the new seam_solver
+                                          # gets seams sub-pixel-tight; a
+                                          # 6 px residual now means a real
+                                          # mismatch, not just ICP slack.
+SEAM_MAX_OVERLAP_FRAC           = 0.18   # fraction of edge points overlapping
+SEAM_MIN_COVERAGE               = 0.55   # arc-length coverage of both edges
+
+# ─── Grid / binary fast-filter (Phase 3, Step 9) ──────────────────────────
+# Optional pre-screening layer that runs before the SW + Procrustes + ICP
+# matcher and the Siamese gate. For each fragment we extract a 20-px band
+# inside every torn edge, Otsu-binarize, tile into 16x16 blocks, compute a
+# uniform-LBP histogram per block, and run a 2-point rigid-transform
+# RANSAC over block correspondences to score pair plausibility. The top-K
+# survivors per fragment are intersected with the existing edge-length +
+# paper-color prefilter — only pairs that survive BOTH gates reach the
+# expensive matcher.
+#
+# When disabled the assembly path falls back to the legacy paper-color
+# prefilter only, so the filter is safe to toggle off if a regression
+# is suspected.
+GRID_FILTER_ENABLED         = True
+GRID_FILTER_TOP_K           = 8     # top-K partner indices kept per fragment
+GRID_FILTER_BAND_DEPTH_PX   = 20    # band depth (px) inward from torn edge
+GRID_FILTER_BLOCK_SIZE      = 16    # tile size; blocks are block_size x block_size
+GRID_FILTER_LBP_P           = 8     # LBP neighbours
+GRID_FILTER_LBP_R           = 1     # LBP radius
+GRID_FILTER_TOP_BLOCK_NN    = 3     # nearest-neighbour width per query block
+GRID_FILTER_RANSAC_ITERS    = 64    # 2-point RANSAC iterations per pair
+GRID_FILTER_RANSAC_TOL_PX   = 8.0   # inlier tolerance in pixels
+GRID_FILTER_MIN_INLIERS     = 3     # minimum spatially-consistent block matches
+
+# ─── Siamese edge matcher (Phase 4, Steps 11-12) ──────────────────────────
+# A trained CNN (EdgeMatcher, ~520 K params) added as the FIFTH gate in the
+# matching cascade. It runs after Procrustes + ICP refinement and BEFORE the
+# SDT physical gate, scoring whether the two aligned torn edge strips
+# visually match. The model is loaded once at pipeline startup (see
+# untorn.edge_matcher.load) and queried in untorn.matching._match_edge_pair.
+#
+# Why 0.985 instead of the plan's 0.55: the trained checkpoint sits at
+# temperature ~10 (logit_scale init=log(10)), so positive examples cluster
+# very near probability 1.0 and negatives near 0.0. Eval (val.h5, 8 K pairs)
+# gave AUC=0.924, with the F1-max threshold at 0.9886 and the
+# precision@recall=0.9 threshold at 0.9936. 0.985 sits between the two,
+# slightly toward the F1 side so we don't reject too many true matches.
+#
+# The full 5-gate cascade (SW + Procrustes + ICP + Siamese + SDT) gives the
+# Siamese gate a job: catch "right-curvature wrong-edge" false positives
+# that survive geometry but visually don't belong together. Real matches
+# should sail through; the gate is the cheapest learned check we have to
+# kill that final class of geometric near-misses.
+#
+# Set EDGE_MATCHER_ENABLED = False or move the checkpoint out of the way to
+# fall back to the legacy 4-gate cascade with no other code changes.
+EDGE_MATCHER_ENABLED        = True
+EDGE_MATCHER_CHECKPOINT     = "models/edge_matcher.pt"
+EDGE_MATCHER_DEVICE         = "cuda"     # falls back to CPU if unavailable
+# Relaxed from the train-time-derived 0.985 to 0.55. The high threshold was
+# tuned on the validation distribution of the training data; on real-world
+# scans it discards most true matches (visual jitter, paper colour drift,
+# different ink). 0.55 still catches obvious negatives (the train-time
+# AUC-ROC at 0.5 was 0.93) without nuking the MST. Bump back up if false
+# positives become the dominant failure mode again.
+EDGE_MATCHER_MIN_SCORE      = 0.55
+EDGE_MATCHER_POSE_WEIGHT    = 0.0        # optional pose-blend weight (unused
+                                          # at inference today; reserved for
+                                          # future ICP warm-start work).
+
+# ─── Composition (Phase 4) — polygon-clip / Step 6 ─────────────────────────
+# The composition runs a SUPERSAMPLED warp of each fragment's mask, RGB
+# crop and *interior SDT* onto a shared canvas. At every canvas pixel
+# the WINNER is the fragment with the LARGEST interior-edge-distance
+# (i.e. the pixel that lies "deepest" inside one of the fragments —
+# overlapping seams resolve to the fragment whose boundary is farther
+# away). One pixel = one fragment, no feathered alpha blending.
+#
+# Small seam-zone gaps (uncovered pixels within ``COMP_SEAM_FILL_MAX_PX``
+# of a placed fragment) are filled by a Voronoi-of-fragments lookup —
+# each gap pixel takes the colour of its nearest covered pixel. Larger
+# uncovered regions are forwarded to ``gap_fill`` as a true-hole mask.
+#
+# This replaces the prior feathered-alpha policy, which hid (rather than
+# eliminated) seam gaps, and the smaller-on-top z-order, which let tiny
+# crumbs paint over the centres of large fragments.
 COMP_SUPERSAMPLE                = 2       # 2x warp canvas, downsampled with INTER_AREA
-COMP_FEATHER_PX                 = 1.5     # output-space cosine feather radius
 COMP_LAB_HARMONISE_ENABLED      = True
 COMP_INK_THRESH                 = 140     # L below this is treated as ink
+COMP_SEAM_FILL_MAX_PX           = 6.0     # uncovered pixels within this many
+                                           # px of coverage are Voronoi-filled
+                                           # from the nearest covered pixel
 
 # ─── Gap fill / hole classification (Phase 5) ──────────────────────────────
 # After composition we classify each connected hole as small / medium /
@@ -328,16 +472,46 @@ MAX_ATTACH_COST             = 400.0
 
 # ─── Global pose-graph bundle adjustment (LM-style) ───────────────────────
 # The assembly's final pass treats cached (i, j) pair matches as a
-# POSE-GRAPH: every match contributes a "seam-point coincidence"
-# constraint and we jointly re-solve for every non-seed fragment's
-# (θ, tx, ty). Closes gaps that single-pair optimisation cannot see.
-# Per-fragment drift is bounded by BA_MAX_{ROTATION_DEG, TRANSLATION_PX}
-# as a safety cap — large LM moves are almost always a sign that a
-# spurious cached match is dominating the least-squares cost.
+# POSE-GRAPH and jointly re-solves every non-seed fragment's (θ, tx, ty).
+#
+# Step 5 — contact-constrained BA: residuals come from two sources per
+# placed pair:
+#   * SW seam-coincidence — sparse, ~10 correspondences per pair, the
+#     legacy term that anchored the previous BA.
+#   * Dense edge correspondences — BA_DENSE_EDGE_SAMPLES samples per
+#     torn edge resampled at equal arc length; each warped sample of B
+#     is told to coincide with its nearest warped sample of A (and vice
+#     versa via the symmetric residual). This is what closes seam gaps
+#     globally — dropping an edge from 5 SW correspondences to ~50
+#     contact constraints turns the seam from "two pinned points" into
+#     "two welded polylines".
+#
+# The dense term costs one cKDTree per pair per LM iteration; on a 30-
+# fragment scene with 30 placed pairs and ~200 iterations that's ~6k
+# KDTree queries — sub-second in practice.
 BA_MAX_ITER                 = 200
 BA_FUNC_TOL                 = 1e-6
 BA_MAX_ROTATION_DEG         = 8.0
 BA_MAX_TRANSLATION_PX       = 60.0
+BA_DENSE_EDGE_ENABLED       = True
+BA_DENSE_EDGE_SAMPLES       = 32      # samples per torn edge (each side)
+BA_DENSE_EDGE_WEIGHT        = 0.6     # relative weight vs. SW correspondences
+
+# ─── Seam solver — post-MST edge-contact pose refinement (Step 4) ────────
+# After the MST grows, every adjacent placed pair has a pose derived from
+# Procrustes + ICP on a sub-arc of the matched correspondences. The seam
+# solver runs a small derivative-free optimisation on (Δθ, Δdx, Δdy) for
+# the attached fragment, minimising `evaluate_edge_fit.fit_cost` (gap +
+# overlap + uncovered) plus an explicit penalty on absolute pixel-level
+# overlap. Hard caps prevent the solver from drifting into a different
+# basin; a small improvement threshold guards against pure-noise updates.
+SEAM_SOLVER_ENABLED         = True
+SEAM_SOLVER_MAX_ITER        = 40       # Nelder-Mead simplex evaluations
+SEAM_SOLVER_LAMBDA_OVERLAP  = 0.6      # weight on absolute SDT-penetration px
+SEAM_SOLVER_MAX_DRIFT_DEG   = 2.0
+SEAM_SOLVER_MAX_DRIFT_PX    = 5.0
+SEAM_SOLVER_MIN_IMPROVEMENT = 0.5      # only accept refinement if cost drops
+                                        # by at least this many units
 
 # ─── Orphan rescue ────────────────────────────────────────────────────────
 # After MST growth, any fragment left unplaced drops all pretense of

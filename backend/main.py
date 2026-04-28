@@ -24,7 +24,7 @@ from pydantic import BaseModel
 
 from .models.schemas import DebugResponse, JobStatusResponse, ProcessResponse
 from .pipeline_wrapper import run_pipeline
-from .services.job_service import create_job, get_job, list_jobs, update_job
+from .services.job_service import create_job, get_job, list_jobs, update_job, get_queue_state
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -98,6 +98,7 @@ async def get_status(job_id: str):
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    queue_position, queued_count = get_queue_state(job_id)
     return {
         "job_id": job_id,
         "status":       job["status"],
@@ -105,6 +106,10 @@ async def get_status(job_id: str):
         "current_phase": job["current_phase"],
         "logs":         job.get("logs", []),
         "error":        job.get("error"),
+        "queue_position": queue_position,
+        "queued_count": queued_count,
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
     }
 
 
@@ -154,7 +159,9 @@ async def get_debug(job_id: str):
     result["fragments"] = read_json(debug_dir / "segmentation" / "fragments_meta.json")
     result["contours"] = read_json(debug_dir / "contours" / "contours_meta.json")
     result["neighbors"] = (
-        read_json(debug_dir / "matching" / "neighbors.json")
+        read_json(debug_dir / "reconstruction" / "neighbors.json")
+        or read_json(debug_dir / "reconstruction" / "match_scores.json")
+        or read_json(debug_dir / "matching" / "neighbors.json")
         or read_json(debug_dir / "matching" / "match_scores.json")
     )
     raw_steps = read_json(debug_dir / "reconstruction" / "merge_log.json") or []
@@ -162,13 +169,13 @@ async def get_debug(job_id: str):
     result["composition"] = read_json(debug_dir / "composition" / "composition_meta.json")
     result["inpainting"] = read_json(debug_dir / "inpainting" / "inpainting_meta.json")
 
-    # Backward/forward compatibility: older frontend expects gap_pixels_inpainted,
-    # newer composition metadata may expose gap_pixels_detected.
+    # Backward/forward compatibility between older/newer composition metadata.
     if isinstance(result["composition"], dict):
-        if "gap_pixels_inpainted" not in result["composition"]:
-            result["composition"]["gap_pixels_inpainted"] = int(
-                result["composition"].get("gap_pixels_detected", 0) or 0
-            )
+        comp = result["composition"]
+        if "gap_pixels_inpainted" not in comp:
+            comp["gap_pixels_inpainted"] = int(comp.get("gap_pixels_detected", 0) or 0)
+        if "gap_pixels_detected" not in comp:
+            comp["gap_pixels_detected"] = int(comp.get("gap_pixels_inpainted", 0) or 0)
 
     translations = result["translations"] if isinstance(result["translations"], dict) else {}
 
@@ -241,13 +248,37 @@ async def get_debug(job_id: str):
             "segmentation/05_final_fragments_overlay.png",
         ),
         "contours_overlay": pick_single("contours/all_support_points.png"),
-        "neighbor_graph": pick_single("matching/neighbor_graph.png"),
+        "neighbor_graph": pick_single(
+            "reconstruction/neighbor_graph.png",
+            "matching/neighbor_graph.png",
+        ),
         "composition_raw": pick_single("composition/01_raw_composite.png"),
         "composition_gap": pick_single("composition/03_gap_mask.png"),
-        "composition_inpainted": pick_single("composition/04_inpainted.png"),
+        # New pipeline no longer writes composition/04_inpainted.png; keep legacy
+        # first, then fall back to Phase 5 cleaned output.
+        "composition_inpainted": pick_single(
+            "composition/04_inpainted.png",
+            "inpainting/04_cleaned.png",
+            "inpainting/03_cleaned.png",
+        ),
         "inpainting_before": pick_single("inpainting/01_before.png"),
-        "inpainting_mask": pick_single("inpainting/02_scar_mask.png"),
-        "inpainting_cleaned": pick_single("inpainting/03_cleaned.png"),
+        # Gap-fill module writes 03_repair_mask + 04_cleaned; legacy Phase 5 writes
+        # 02_scar_mask + 03_cleaned.
+        "inpainting_mask": pick_single(
+            "inpainting/03_repair_mask.png",
+            "inpainting/02_scar_mask.png",
+            "inpainting/02_holes_interior.png",
+        ),
+        "inpainting_cleaned": pick_single(
+            "inpainting/04_cleaned.png",
+            "inpainting/03_cleaned.png",
+        ),
+        # Extra debugging surfaces for the newer gap-fill pipeline.
+        "inpainting_holes": pick_single("inpainting/02_holes_interior.png"),
+        "inpainting_repair_mask": pick_single(
+            "inpainting/03_repair_mask.png",
+            "inpainting/02_scar_mask.png",
+        ),
         "fragment_crops": pick_many([
             f"segmentation/07_crop_{i:02d}.png" if (debug_dir / f"segmentation/07_crop_{i:02d}.png").exists() else f"segmentation/06_crop_{i:02d}.png"
             for i in frag_ids
@@ -279,7 +310,11 @@ async def get_debug_image(job_id: str, path: str):
                  ".jpeg": "image/jpeg", ".tif": "image/tiff"}
     media_type = media_map.get(suffix, "image/png")
 
-    return FileResponse(str(image_path), media_type=media_type)
+    return FileResponse(
+        str(image_path),
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
 
 
 # ── Assembly Board endpoints ──────────────────────────────────────────────────
@@ -537,7 +572,10 @@ async def export_board(job_id: str, req: BoardExportRequest):
     coverage = _build_coverage(canvas.size, placed_masks)
 
     if req.clean:
-        # LaMa seam cleaning replaces the classical seam_healing entirely.
+        # LaMa seam cleaning. If LaMa is unavailable we return the raw paste
+        # without the legacy hand-rolled seam healing — that healing path was
+        # removed in the Step 1 cleanup because it produced visibly worse
+        # results than just leaving the seam alone.
         try:
             from untorn.inpainting import build_scar_mask, inpaint, is_available as lama_available
             if not lama_available():
@@ -549,14 +587,10 @@ async def export_board(job_id: str, req: BoardExportRequest):
                 rgb_arr = inpaint(rgb_arr, scar, tile=True, refine=bool(req.refine))
             output = Image.fromarray(rgb_arr, "RGB")
         except Exception as exc:
-            # Fall back to the legacy classical seam healing so export never fails
-            print(f"[export] LaMa cleaning failed, falling back to seam healing: {exc}")
-            _apply_seam_healing(canvas, placed_masks, threshold=5 * scale)
+            print(f"[export] LaMa cleaning unavailable, returning raw paste: {exc}")
             output = Image.new("RGB", canvas.size, (255, 255, 255))
             output.paste(canvas, mask=canvas.split()[-1])
     else:
-        # User explicitly asked for raw output — run classical seam healing only.
-        _apply_seam_healing(canvas, placed_masks, threshold=5 * scale)
         output = Image.new("RGB", canvas.size, (255, 255, 255))
         output.paste(canvas, mask=canvas.split()[-1])
 
@@ -588,108 +622,6 @@ def _build_coverage(canvas_size: tuple[int, int],
         region = alpha[ay1:ay2, ax1:ax2] > 128
         cov[y1:y2, x1:x2][region] = 255
     return cov
-
-
-def _apply_seam_healing(canvas: Image.Image, placed_masks: list, threshold: int = 5):
-    """
-    Simple seam healing: for pixels in the gap between two close fragments,
-    blend colors from the nearest edge pixels of both fragments.
-    Only affects the thin strip between nearly-touching fragments.
-    """
-    canvas_arr = np.array(canvas)
-    h, w = canvas_arr.shape[:2]
-
-    # Build a combined alpha map and a fragment-ID map
-    frag_map = np.full((h, w), -1, dtype=np.int16)
-    alpha_map = np.zeros((h, w), dtype=np.uint8)
-
-    for idx, (alpha, px, py) in enumerate(placed_masks):
-        ah, aw = alpha.shape
-        # Clip to canvas bounds
-        y1, y2 = max(0, py), min(h, py + ah)
-        x1, x2 = max(0, px), min(w, px + aw)
-        ay1, ay2 = y1 - py, y2 - py
-        ax1, ax2 = x1 - px, x2 - px
-
-        mask_region = alpha[ay1:ay2, ax1:ax2] > 128
-        frag_map[y1:y2, x1:x2][mask_region] = idx
-        alpha_map[y1:y2, x1:x2][mask_region] = 255
-
-    # Find gap pixels: not covered by any fragment
-    gap_mask = alpha_map < 128
-
-    if not np.any(gap_mask):
-        return
-
-    # For each gap pixel, check distance to nearest fragment edge
-    from scipy.ndimage import distance_transform_edt, label
-
-    # Distance from gap to any fragment
-    dist_to_frag = distance_transform_edt(gap_mask)
-
-    # Only heal pixels within threshold distance of fragments
-    heal_candidates = gap_mask & (dist_to_frag <= threshold)
-
-    if not np.any(heal_candidates):
-        return
-
-    # For healing, dilate each fragment slightly and check for overlap zones
-    from scipy.ndimage import binary_dilation
-
-    struct = np.ones((threshold * 2 + 1, threshold * 2 + 1), dtype=bool)
-    dilated_maps: list[np.ndarray] = []
-    for idx in range(len(placed_masks)):
-        frag_mask = frag_map == idx
-        dilated = binary_dilation(frag_mask, structure=struct)
-        dilated_maps.append(dilated)
-
-    # Find pixels where at least 2 dilated fragments overlap AND it's a gap pixel
-    overlap_count = np.zeros((h, w), dtype=np.int16)
-    for dm in dilated_maps:
-        overlap_count += dm.astype(np.int16)
-
-    seam_pixels = heal_candidates & (overlap_count >= 2)
-
-    if not np.any(seam_pixels):
-        return
-
-    # For seam pixels, blend using distance-weighted average from nearby fragment edges
-    ys, xs = np.where(seam_pixels)
-
-    for y, x in zip(ys, xs):
-        colors = []
-        weights = []
-        for idx, (alpha, px, py) in enumerate(placed_masks):
-            if not dilated_maps[idx][y, x]:
-                continue
-            # Find nearest opaque pixel from this fragment
-            frag_mask = frag_map == idx
-            # Simple: sample the nearest edge pixel in a small window
-            r = threshold + 2
-            y1c, y2c = max(0, y - r), min(h, y + r + 1)
-            x1c, x2c = max(0, x - r), min(w, x + r + 1)
-            local_frag = frag_mask[y1c:y2c, x1c:x2c]
-            if not np.any(local_frag):
-                continue
-            local_ys, local_xs = np.where(local_frag)
-            dists = np.sqrt((local_ys - (y - y1c)) ** 2 + (local_xs - (x - x1c)) ** 2)
-            nearest_idx = np.argmin(dists)
-            nearest_y = y1c + local_ys[nearest_idx]
-            nearest_x = x1c + local_xs[nearest_idx]
-            d = max(dists[nearest_idx], 0.5)
-            colors.append(canvas_arr[nearest_y, nearest_x, :3].astype(np.float64))
-            weights.append(1.0 / d)
-
-        if colors:
-            weights_arr = np.array(weights)
-            weights_arr /= weights_arr.sum()
-            blended = sum(c * w for c, w in zip(colors, weights_arr))
-            canvas_arr[y, x, :3] = np.clip(blended, 0, 255).astype(np.uint8)
-            canvas_arr[y, x, 3] = 255
-
-    # Write back
-    healed = Image.fromarray(canvas_arr, "RGBA")
-    canvas.paste(healed)
 
 
 # ── WebSocket real-time progress ──────────────────────────────────────────────

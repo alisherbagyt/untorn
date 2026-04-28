@@ -1,12 +1,11 @@
 """
 untorn.inpainting
 =================
-Phase 5: LaMa-powered seam/scar removal.
-
-Exposes a process-level singleton for the LaMa big-lama model, a text-preserving
-scar-mask builder, tiled inference (so we can handle full-resolution scans in
-limited VRAM), and the `clean_final` Phase 5 orchestrator called from the
-pipeline. The same service is used by the FastAPI backend for Assembly export.
+LaMa-powered hole filling. Phase 5 is orchestrated by ``untorn.gap_fill``;
+this module provides the LaMa backend (JIT / simple_lama / saicinpainting)
+plus a text-preserving scar-mask builder and tiled inference for big
+canvases. The FastAPI backend's Assembly export route also calls
+``inpaint`` directly.
 """
 
 from __future__ import annotations
@@ -435,80 +434,5 @@ def inpaint(
     return np.where(m3 > 0, predicted, image_rgb)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Phase 5 orchestrator
-# ══════════════════════════════════════════════════════════════════════════════
-
-def clean_final(
-    canvas_rgb: np.ndarray,
-    coverage: np.ndarray,
-    gap_mask: Optional[np.ndarray],
-    debug_dir: Path,
-    *,
-    refine: bool = False,
-) -> np.ndarray:
-    """
-    Phase 5 entry point called from pipeline.py.
-
-    Args:
-        canvas_rgb: uncropped composed canvas (post cv2-inpaint fill).
-        coverage:   uint8 mask of placed fragments on the same canvas.
-        gap_mask:   optional uint8 mask of pre-inpainted gaps (for record).
-        debug_dir:  per-job debug directory.
-        refine:     use LaMa's slow refinement mode.
-
-    Returns:
-        cleaned RGB canvas, same HxW as input.
-    """
-    out_dir = debug_dir / "inpainting"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    save_image(canvas_rgb, str(out_dir / "01_before.png"))
-
-    if not is_available():
-        print("  ! LaMa checkpoint missing — skipping Phase 5 (cleaning disabled).")
-        meta = {"status": "SKIPPED_NO_MODEL"}
-        with open(out_dir / "inpainting_meta.json", "w") as f:
-            json.dump(meta, f, indent=2)
-        save_image(canvas_rgb, str(out_dir / "03_cleaned.png"))
-        return canvas_rgb
-
-    print("  Building scar mask ...")
-    scar = build_scar_mask(canvas_rgb, coverage, gap_mask=gap_mask)
-    save_mask(scar, str(out_dir / "02_scar_mask.png"))
-    mask_px = int((scar > 0).sum())
-    print(f"  Scar pixels: {mask_px:,}")
-
-    t0 = time.time()
-    print(f"  Running LaMa{' (refine)' if refine else ''} ...")
-    backend = None
-    try:
-        cleaned = inpaint(canvas_rgb, scar, tile=True, refine=refine)
-        status = "OK"
-        err = None
-        backend = _predictor.kind if _predictor is not None else None
-    except Exception as exc:
-        print(f"  ! LaMa failed: {exc}")
-        cleaned = canvas_rgb
-        status = "FAILED"
-        err = str(exc)
-
-    dt = round(time.time() - t0, 2)
-    save_image(cleaned, str(out_dir / "03_cleaned.png"))
-
-    import torch
-    meta = {
-        "status": status,
-        "error": err,
-        "backend": backend,
-        "mask_pixels": mask_px,
-        "duration_s": dt,
-        "device": "cuda" if torch.cuda.is_available() else "cpu",
-        "refine": bool(refine),
-        "band_px": INPAINT_BAND_PX,
-        "ink_threshold": INPAINT_INK_THRESH,
-    }
-    with open(out_dir / "inpainting_meta.json", "w") as f:
-        json.dump(meta, f, indent=2)
-
-    return cleaned
+# Phase 5 is orchestrated by `untorn.gap_fill.inpaint_gaps`; the legacy
+# `clean_final` entrypoint that lived here was removed in Step 1 cleanup.

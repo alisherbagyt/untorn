@@ -18,13 +18,19 @@ const PHASES = [
   { key: "contours",       label: "Анализ контуров",  desc: "Извлечение краёв и SDF" },
   { key: "reconstruction", label: "Реконструкция",    desc: "Попарное сопоставление и объединение" },
   { key: "composition",    label: "Компоновка",       desc: "Дорисовка в полном разрешении" },
+  { key: "gap_fill",       label: "Заполнение пропусков", desc: "LaMa очищает швы и пробелы" },
 ];
 
 type PhaseStatus = "done" | "active" | "pending";
 
+function normalizePhase(phase: string): string {
+  if (phase === "inpainting") return "gap_fill";
+  return phase;
+}
+
 function getPhaseStatus(phaseKey: string, currentPhase: string, overallStatus: string): PhaseStatus {
   const order = PHASES.map((p) => p.key);
-  const currentIdx = order.indexOf(currentPhase);
+  const currentIdx = order.indexOf(normalizePhase(currentPhase));
   const phaseIdx   = order.indexOf(phaseKey);
 
   if (overallStatus === "done") return "done";
@@ -35,6 +41,9 @@ function getPhaseStatus(phaseKey: string, currentPhase: string, overallStatus: s
 
 export function ProcessingView({ status }: ProcessingViewProps) {
   const isError = status.status === "error";
+  const queuePos = status.queue_position ?? 0;
+  const queueCount = status.queued_count ?? 0;
+  const recentLogs = (status.logs ?? []).slice(-6).reverse();
 
   return (
     <div className="w-full max-w-2xl mx-auto flex flex-col gap-5 animate-slide-up">
@@ -56,8 +65,14 @@ export function ProcessingView({ status }: ProcessingViewProps) {
           <div className="text-sm text-secondary">
             {isError
               ? `Ошибка: ${status.error ?? "Неизвестная ошибка"}`
-              : `Фаза: ${phaseLabel(status.current_phase)}`}
+              : `Фаза: ${phaseLabel(normalizePhase(status.current_phase))}`}
           </div>
+
+          {status.status === "queued" && queueCount > 0 && (
+            <div className="text-xs text-secondary">
+              В очереди: {queuePos > 0 ? `позиция ${queuePos} из ${queueCount}` : `${queueCount} задач`}
+            </div>
+          )}
 
           {/* Phase timeline */}
           <div className="mt-2 space-y-2">
@@ -112,6 +127,24 @@ export function ProcessingView({ status }: ProcessingViewProps) {
           </div>
         </CardBody>
       </Card>
+
+      {/* Live logs */}
+      {recentLogs.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Живой журнал</CardTitle>
+          </CardHeader>
+          <CardBody>
+            <div className="space-y-2 text-xs text-secondary font-mono">
+              {recentLogs.map((line, idx) => (
+                <div key={`${line}-${idx}`} className="bg-muted/60 rounded-lg px-3 py-2">
+                  {line}
+                </div>
+              ))}
+            </div>
+          </CardBody>
+        </Card>
+      )}
 
     </div>
   );

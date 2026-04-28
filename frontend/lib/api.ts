@@ -7,6 +7,10 @@ export interface JobStatus {
   current_phase: string;
   logs: string[];
   error?: string;
+  queue_position?: number;
+  queued_count?: number;
+  started_at?: string | null;
+  finished_at?: string | null;
 }
 
 export interface DebugData {
@@ -19,6 +23,9 @@ export interface DebugData {
     n_fragments: number;
     status: string;
     timings: Record<string, number>;
+    edge_matcher_loaded?: boolean;
+    missing_fragment?: boolean;
+    hole_counts?: Record<string, number>;
   };
   fragments?: Array<{
     id: number;
@@ -67,19 +74,24 @@ export interface DebugData {
     refine?: boolean;
     band_px?: number;
     ink_threshold?: number;
+    hole_counts?: Record<string, number>;
+    largest_hole_frac?: number;
+    missing_fragment?: boolean;
   };
   paths?: {
-    input: string;
-    sam_overlay: string;
-    segmentation_overlay: string;
-    contours_overlay: string;
-    neighbor_graph: string;
-    composition_raw: string;
-    composition_gap: string;
-    composition_inpainted: string;
-    inpainting_before: string;
-    inpainting_mask: string;
-    inpainting_cleaned: string;
+    input?: string;
+    sam_overlay?: string;
+    segmentation_overlay?: string;
+    contours_overlay?: string;
+    neighbor_graph?: string;
+    composition_raw?: string;
+    composition_gap?: string;
+    composition_inpainted?: string;
+    inpainting_before?: string;
+    inpainting_mask?: string;
+    inpainting_cleaned?: string;
+    inpainting_holes?: string;
+    inpainting_repair_mask?: string;
     fragment_crops: string[];
     fragment_masks: string[];
     fragment_sdfs: string[];

@@ -1,5 +1,6 @@
 services:
   backend:
+    image: ghcr.io/alisherbagyt/untorn-backend:v3.3
     build:
       context: .
       dockerfile: Dockerfile.backend
@@ -24,6 +25,7 @@ services:
     restart: unless-stopped
 
   frontend:
+    image: ghcr.io/alisherbagyt/untorn-frontend:v3.3
     build:
       context: .
       dockerfile: Dockerfile.frontend

@@ -4,30 +4,20 @@ untorn.gap_fill
 Phase 5 front-end — classify holes in the composed canvas, build a
 text-aware repair mask, and dispatch to the LaMa backend.
 
-Why this exists as a separate module:
-  * The old pipeline lumped "seam cleaning" and "missing fragment filling"
-    into one pass (`inpainting.clean_final`). The result: small seams got
-    hallucinated over, large holes produced unbounded smears, and there
-    was no way to tell the caller "a real fragment is missing here".
-  * This module makes hole handling explicit:
-        edge hole     — touches the canvas border; just cropped out
-        small hole    — area < GAP_SMALL_FRAC of doc, ride along with
-                        normal seam scar
-        medium hole   — GAP_SMALL_FRAC..GAP_MEDIUM_FRAC, LaMa with its
-                        context expanded so there's enough paper/text
-                        around the hole to hallucinate a plausible fill
-        large hole    — > GAP_MEDIUM_FRAC, flagged as missing_fragment
-                        but LaMa still runs best-effort so the image is
-                        completable.
-  * The existing text-aware scar-mask builder (`inpainting.build_scar_mask`)
-    is reused verbatim for the ring around placed fragments.
+Post-Step-6 the composition step does the work that used to fall on this
+module for "small" holes: any uncovered pixel within
+``COMP_SEAM_FILL_MAX_PX`` of a placed fragment is Voronoi-filled from
+the nearest covered pixel, so by the time gap_fill runs every remaining
+hole is genuinely far from any fragment. Hole classification therefore
+collapses to two cases:
+    edge hole   — touches the canvas border; just cropped out by composition
+    interior hole — handed to LaMa for hallucination, with `medium` /
+                    `large` distinction kept only for context-expansion
+                    sizing and missing-fragment reporting.
 
 Public entry:
     inpaint_gaps(canvas, coverage, debug_dir, *, refine=False)
        -> {"canvas": cleaned, "meta": {...}}
-
-The function returns a dict so the pipeline can surface missing-fragment
-metadata up to the user.
 """
 
 from __future__ import annotations
