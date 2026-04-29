@@ -1,18 +1,18 @@
 """
-Stage-6 regression test for untorn.composition.
+Regression test for untorn.composition (polygon-clip / Step 6).
 
-Covers three behaviours the new composition pipeline introduces:
+The polygon-clip composition uses a winner-take-all by interior SDT and a
+Voronoi seam-fill. The legacy `_feathered_alpha` helper was retired with
+the rewrite, so this test exercises the public surface that's actually
+shipping:
 
   1. `_fragment_paper_lab` excludes ink pixels and returns a clean paper
-     LAB mean; completely ink-free fragments and fully-inked fragments
-     both return sensible outputs.
-  2. `_apply_lab_shift` nudges paper pixels toward the target LAB while
-     leaving ink (L < ink_thresh) essentially unchanged — so text
-     contrast is preserved.
+     LAB mean; an all-ink fragment returns None.
+  2. `_apply_lab_shift` brightens paper pixels by the requested ΔL while
+     leaving ink (L < ink_thresh) essentially unchanged.
   3. `compose_final` runs end-to-end on a 2-fragment synthetic layout,
-     returns the expected keys, produces a canvas containing both
-     fragments (measured by coverage area), and persists its debug
-     artefacts without crashing.
+     returns the documented keys, covers most of the placed pixels, and
+     emits the debug artefacts the frontend depends on.
 """
 from __future__ import annotations
 
@@ -31,7 +31,6 @@ from untorn.composition import (
     compose_final,
     _fragment_paper_lab,
     _apply_lab_shift,
-    _feathered_alpha,
 )
 
 
@@ -39,7 +38,6 @@ def test_fragment_paper_lab_excludes_ink():
     """LAB mean should reflect paper, not the black ink bars on top."""
     H, W = 100, 100
     rgb = np.full((H, W, 3), (238, 232, 214), dtype=np.uint8)   # cream paper
-    # Paint three black ink bars — should all be excluded
     for ry in (20, 45, 70):
         cv2.rectangle(rgb, (10, ry), (90, ry + 6), (20, 20, 20), -1)
     mask = np.full((H, W), 255, dtype=np.uint8)
@@ -59,42 +57,23 @@ def test_fragment_paper_lab_returns_none_when_no_paper():
 
 
 def test_apply_lab_shift_spares_ink():
-    """
-    Shift an obvious amount (L +20) into paper and check that ink-dark
-    pixels move far less than paper pixels.
-    """
+    """L+20 shift: paper brightens, ink stays dark."""
     H, W = 64, 64
     rgb = np.full((H, W, 3), 220, dtype=np.uint8)       # paper
     rgb[30:40, 10:54] = (25, 25, 25)                    # ink stripe
     mask = np.full((H, W), 255, dtype=np.uint8)
     out = _apply_lab_shift(rgb, mask, delta_lab=(20.0, 0.0, 0.0),
                            ink_thresh=140)
-    # Paper region should brighten; ink region should stay dark.
     paper_before = rgb[5, 5].astype(np.float32).mean()
-    paper_after = out[5, 5].astype(np.float32).mean()
-    ink_before = rgb[35, 30].astype(np.float32).mean()
-    ink_after = out[35, 30].astype(np.float32).mean()
+    paper_after  = out[5, 5].astype(np.float32).mean()
+    ink_before   = rgb[35, 30].astype(np.float32).mean()
+    ink_after    = out[35, 30].astype(np.float32).mean()
     print(f"  paper {paper_before:.1f}->{paper_after:.1f}  "
           f"ink {ink_before:.1f}->{ink_after:.1f}")
     assert paper_after > paper_before + 3.0, \
         f"paper should brighten, got {paper_before:.1f}->{paper_after:.1f}"
     assert abs(ink_after - ink_before) < 3.0, \
         f"ink should barely move, got {ink_before:.1f}->{ink_after:.1f}"
-
-
-def test_feathered_alpha_is_smooth_and_bounded():
-    """Alpha goes to 0 at the boundary and 1 well inside."""
-    H, W = 80, 80
-    mask = np.zeros((H, W), dtype=np.uint8)
-    cv2.rectangle(mask, (10, 10), (70, 70), 1, -1)
-    a = _feathered_alpha(mask, feather_px=3.0)
-    assert a.dtype == np.float32
-    assert 0.0 <= float(a.min()) and float(a.max()) <= 1.0
-    # Deep interior should be 1.0
-    assert a[40, 40] > 0.95, f"interior alpha should be ~1, got {a[40, 40]}"
-    # Pixel just inside boundary should be between 0 and 1 (feathered)
-    assert 0.0 < a[10, 40] < 0.9, \
-        f"boundary alpha should ramp, got {a[10, 40]}"
 
 
 def _make_fragment(mask: np.ndarray, fid: int) -> dict:
@@ -111,7 +90,7 @@ def _make_fragment(mask: np.ndarray, fid: int) -> dict:
 
 
 def test_compose_final_end_to_end():
-    """Two fragments side-by-side, identity transforms, no crash, coverage."""
+    """Two fragments side-by-side, identity transforms, Voronoi seam-fill, no crash."""
     H, W = 120, 240
     img = np.full((H, W, 3), 238, dtype=np.uint8)
     for ry in (30, 60, 90):
@@ -128,13 +107,14 @@ def test_compose_final_end_to_end():
         debug_dir = Path(tmp)
         res = compose_final(img, frags, transforms, debug_dir)
 
-        # Keys
+        # Documented keys
         for k in ("canvas", "coverage", "gap_mask", "crop_bbox"):
             assert k in res, f"missing key {k}"
         canvas = res["canvas"]
         coverage = res["coverage"]
         assert canvas.ndim == 3 and canvas.shape[2] == 3
         assert coverage.shape[:2] == canvas.shape[:2]
+
         # Coverage pixels should exceed half of both source masks' area
         area_src = int((mask_a > 127).sum()) + int((mask_b > 127).sum())
         area_cov = int((coverage > 127).sum())
@@ -142,16 +122,19 @@ def test_compose_final_end_to_end():
         assert area_cov > area_src * 0.5, \
             f"coverage should capture most placed pixels; "\
             f"got {area_cov}/{area_src}"
-        # Debug artefacts persisted
-        assert (debug_dir / "composition" / "01_raw_composite.png").exists()
-        assert (debug_dir / "composition" / "02_coverage_mask.png").exists()
-        assert (debug_dir / "composition" / "composition_meta.json").exists()
+
+        # Debug artefacts persisted under the new (post-rewrite) names.
+        comp_dir = debug_dir / "composition"
+        for name in ("01_raw_composite.png",
+                     "02_coverage_pre_voronoi.png",
+                     "03_coverage_post_voronoi.png",
+                     "composition_meta.json"):
+            assert (comp_dir / name).exists(), f"missing debug artefact {name}"
 
 
 if __name__ == "__main__":
     test_fragment_paper_lab_excludes_ink()
     test_fragment_paper_lab_returns_none_when_no_paper()
     test_apply_lab_shift_spares_ink()
-    test_feathered_alpha_is_smooth_and_bounded()
     test_compose_final_end_to_end()
-    print("composition stage-6 tests passed")
+    print("composition tests passed")

@@ -158,14 +158,13 @@ async def get_debug(job_id: str):
     result["pipeline_meta"] = read_json(debug_dir / "pipeline_meta.json")
     result["fragments"] = read_json(debug_dir / "segmentation" / "fragments_meta.json")
     result["contours"] = read_json(debug_dir / "contours" / "contours_meta.json")
-    result["neighbors"] = (
-        read_json(debug_dir / "reconstruction" / "neighbors.json")
-        or read_json(debug_dir / "reconstruction" / "match_scores.json")
-        or read_json(debug_dir / "matching" / "neighbors.json")
-        or read_json(debug_dir / "matching" / "match_scores.json")
-    )
+    # The current MST-growth assembly does not emit a neighbours graph; the
+    # frontend gracefully degrades when this is null.
+    result["neighbors"] = None
     raw_steps = read_json(debug_dir / "reconstruction" / "merge_log.json") or []
     result["translations"] = read_json(debug_dir / "reconstruction" / "final_translations.json") or {}
+    result["transforms"] = read_json(debug_dir / "reconstruction" / "final_transforms.json") or {}
+    result["assembly_summary"] = read_json(debug_dir / "reconstruction" / "assembly_summary.json")
     result["composition"] = read_json(debug_dir / "composition" / "composition_meta.json")
     result["inpainting"] = read_json(debug_dir / "inpainting" / "inpainting_meta.json")
 
@@ -248,16 +247,20 @@ async def get_debug(job_id: str):
             "segmentation/05_final_fragments_overlay.png",
         ),
         "contours_overlay": pick_single("contours/all_support_points.png"),
-        "neighbor_graph": pick_single(
-            "reconstruction/neighbor_graph.png",
-            "matching/neighbor_graph.png",
-        ),
+        # The MST-growth assembly does not render a neighbour-graph debug
+        # PNG; left as None so the frontend skips the section.
+        "neighbor_graph": None,
         "composition_raw": pick_single("composition/01_raw_composite.png"),
-        "composition_gap": pick_single("composition/03_gap_mask.png"),
-        # New pipeline no longer writes composition/04_inpainted.png; keep legacy
-        # first, then fall back to Phase 5 cleaned output.
+        # composition writes 04_gap_mask.png in the current pipeline; the
+        # 03_gap_mask.png fallback is for older debug dirs only.
+        "composition_gap": pick_single(
+            "composition/04_gap_mask.png",
+            "composition/03_gap_mask.png",
+        ),
+        # The polygon-clip composition no longer writes its own inpainted
+        # snapshot; surface the cleaned output emitted by Phase 5 (gap_fill
+        # → inpainting) instead.
         "composition_inpainted": pick_single(
-            "composition/04_inpainted.png",
             "inpainting/04_cleaned.png",
             "inpainting/03_cleaned.png",
         ),
@@ -384,6 +387,7 @@ async def get_board_data(job_id: str):
 
     fragments = read_json(debug_dir / "segmentation" / "fragments_meta.json")
     translations = read_json(debug_dir / "reconstruction" / "final_translations.json")
+    transforms = read_json(debug_dir / "reconstruction" / "final_transforms.json")
     composition = read_json(debug_dir / "composition" / "composition_meta.json")
     contours = read_json(debug_dir / "contours" / "contours_meta.json")
 
@@ -391,6 +395,7 @@ async def get_board_data(job_id: str):
         raise HTTPException(status_code=400, detail="Incomplete pipeline data")
 
     translations = translations if isinstance(translations, dict) else {}
+    transforms = transforms if isinstance(transforms, dict) else {}
     composition = composition if isinstance(composition, dict) else {}
 
     def _to_float(value, default=0.0):
@@ -404,6 +409,30 @@ async def get_board_data(job_id: str):
     canvas_w = int(_to_float(composition.get("canvas_w", 0), 0))
     canvas_h = int(_to_float(composition.get("canvas_h", 0), 0))
 
+    def _resolve_affine(fid_str: str, trans: dict) -> tuple[np.ndarray, float]:
+        """Return (3x3 affine, rotation_deg) for one fragment.
+
+        Prefers the canonical full-affine matrix from final_transforms.json;
+        falls back to constructing a rotation+translation matrix from
+        final_translations.json (angle_deg + dx + dy). Older translations-
+        only outputs (no angle) degrade to pure translation, which matches
+        the legacy behaviour."""
+        full = transforms.get(fid_str)
+        if isinstance(full, list) and len(full) == 3 and \
+                all(isinstance(row, list) and len(row) == 3 for row in full):
+            M = np.array(full, dtype=np.float64)
+            ang = float(np.degrees(np.arctan2(M[1, 0], M[0, 0])))
+            return M, ang
+        ang_deg = _to_float(trans.get("angle_deg", 0.0), 0.0)
+        dx = _to_float(trans.get("dx", 0.0), 0.0)
+        dy = _to_float(trans.get("dy", 0.0), 0.0)
+        c = math.cos(math.radians(ang_deg))
+        s = math.sin(math.radians(ang_deg))
+        M = np.array([[c, -s, dx],
+                      [s,  c, dy],
+                      [0.0, 0.0, 1.0]], dtype=np.float64)
+        return M, ang_deg
+
     # Build per-fragment board data
     board_fragments = []
     min_x = float("inf")
@@ -416,16 +445,36 @@ async def get_board_data(job_id: str):
         trans = translations.get(fid_str, {}) if isinstance(translations, dict) else {}
         bx, by, bw, bh = frag["bbox_xywh"]
 
-        # Position on the composition canvas
-        dx = _to_float(trans.get("dx", 0.0), 0.0)
-        dy = _to_float(trans.get("dy", 0.0), 0.0)
-        canvas_x = bx + dx - offset_x
-        canvas_y = by + dy - offset_y
+        M, rotation_deg = _resolve_affine(fid_str, trans)
 
-        min_x = min(min_x, canvas_x)
-        min_y = min(min_y, canvas_y)
-        max_x = max(max_x, canvas_x + bw)
-        max_y = max(max_y, canvas_y + bh)
+        # The frontend renders the fragment crop with `transform: rotate` —
+        # CSS rotates around the bbox center by default. To make the
+        # rendered fragment land at its true affine pose, we position the
+        # bbox so its CENTER coincides with the affine-mapped centroid of
+        # the source bbox. The crop is then rotated around that same center.
+        cx0 = bx + bw / 2.0
+        cy0 = by + bh / 2.0
+        canvas_cx = float(M[0, 0] * cx0 + M[0, 1] * cy0 + M[0, 2]) - offset_x
+        canvas_cy = float(M[1, 0] * cx0 + M[1, 1] * cy0 + M[1, 2]) - offset_y
+        canvas_x = canvas_cx - bw / 2.0
+        canvas_y = canvas_cy - bh / 2.0
+
+        # The fragment's rotated bbox extents on the canvas. Used for
+        # canvas-size auto-fit and the global content bounds.
+        rad = math.radians(rotation_deg)
+        c = abs(math.cos(rad))
+        s = abs(math.sin(rad))
+        rot_w = bw * c + bh * s
+        rot_h = bw * s + bh * c
+        bbox_min_x = canvas_cx - rot_w / 2.0
+        bbox_min_y = canvas_cy - rot_h / 2.0
+        bbox_max_x = canvas_cx + rot_w / 2.0
+        bbox_max_y = canvas_cy + rot_h / 2.0
+
+        min_x = min(min_x, bbox_min_x)
+        min_y = min(min_y, bbox_min_y)
+        max_x = max(max_x, bbox_max_x)
+        max_y = max(max_y, bbox_max_y)
 
         board_fragments.append({
             "id": fid,
@@ -433,7 +482,7 @@ async def get_board_data(job_id: str):
             "y": round(canvas_y, 1),
             "width": bw,
             "height": bh,
-            "rotation": 0,
+            "rotation": round(float(rotation_deg), 2),
             "placed": bool(trans.get("placed", False)),
             "area": frag["area"],
             "centroid": frag["centroid"],

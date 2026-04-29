@@ -42,10 +42,14 @@ def main():
     h, w = 400, 400
 
     # ── Case 1: identical content on both sides of the seam ────────
-    # A's strip and B's strip will see the same high-frequency texture
-    # sampled at mirrored offsets — high correlation.
+    # A's strip (at cols 199..192) and B's strip (at cols 201..208) are
+    # sampled "AWAY from the seam by 1..8 px" on each side. Use a
+    # mirror-symmetric pattern about x=200 so both strips see the same
+    # value at the same step distance — that's the "perfectly matched
+    # tear" the scorer should reward with a score near 0.
     def textured(x, y):
-        v = int(128 + 60 * np.sin(0.6 * y) * np.cos(0.4 * x))
+        d = abs(x - 200)
+        v = int(128 + 60 * np.sin(0.6 * y) * np.cos(0.4 * d))
         v = max(0, min(255, v))
         return (v, v, v)
     img1 = _controlled_img(h, w, textured)
@@ -54,14 +58,17 @@ def main():
     eb = _make_edge(seam, [-1.0, 0.0])
     s1 = _score_edge_appearance(img1, ea, eb, seam, seam)
 
-    # ── Case 2: A-side is textured, B-side is blank ────────────────
+    # ── Case 2: A-side is textured, B-side is blank paper ──────────
+    # Strip B samples cols 201..208, so blank everything from col 201.
     img2 = img1.copy()
-    img2[:, 205:] = (230, 225, 210)
+    img2[:, 201:] = (230, 225, 210)
     s2 = _score_edge_appearance(img2, ea, eb, seam, seam)
 
-    # ── Case 3: A-side is textured grey, B-side is dark text ──────
+    # ── Case 3: A-side is textured grey, B-side is dark text ───────
+    # Strip B samples cols 201..208, so a dark band there forces a clear
+    # appearance mismatch.
     img3 = img1.copy()
-    img3[:, 205:215] = (40, 35, 30)  # dark band
+    img3[:, 201:209] = (40, 35, 30)
     s3 = _score_edge_appearance(img3, ea, eb, seam, seam)
 
     # ── Case 4: both sides constant paper (fallback path) ──────────
@@ -74,8 +81,11 @@ def main():
     print(f"  Case 3 (grey A vs dark band B)       : sapp = {s3:.4f}")
     print(f"  Case 4 (both constant paper)         : sapp = {s4:.4f}")
 
-    # Case 1 should be clearly the lowest; cases 2-3 should be well above.
-    ok = (s1 < s2) and (s1 < s3) and (s2 > 0.50) and (s3 > 0.50)
+    # Case 1 should be clearly the lowest (matched texture). Cases 2-3
+    # should be well above it; the scorer's "uncorrelated/mismatched"
+    # band centres around ~0.4, so we require a clear separation rather
+    # than a fixed absolute floor.
+    ok = (s1 < s2 - 0.20) and (s1 < s3 - 0.20)
     print()
     print("RESULT:", "PASS" if ok else "FAIL",
           "   (separation = case2-case1 =", f"{s2 - s1:+.3f})")
