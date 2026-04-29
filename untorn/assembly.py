@@ -1210,6 +1210,11 @@ def reconstruct(fragments: list[dict],
 
     if n < 2:
         print("  -- Only one fragment; nothing to assemble.")
+        _write_assembly_artifacts(
+            fragments=fragments, transforms=transforms,
+            placed=placed, merge_log=merge_log, cache=None,
+            recon_debug=recon_debug, status="trivial_single_fragment",
+        )
         return transforms
 
     # ── Feature preparation ──────────────────────────────────────────────
@@ -1300,6 +1305,15 @@ def reconstruct(fragments: list[dict],
     if not ranked and not seeds:
         print("  -- No candidate pair above the confidence floor. "
               "Returning identity placement.")
+        _write_assembly_artifacts(
+            fragments=fragments, transforms=transforms,
+            placed=placed, merge_log=merge_log, cache=cache,
+            recon_debug=recon_debug,
+            n_candidates=len(candidates),
+            n_ranked=len(ranked), n_mutual=len(mutual),
+            n_seeds=len(seeds),
+            status="no_candidate_above_min_confidence",
+        )
         _finalize_release_dinov2(fragments)
         return transforms
 
@@ -1360,6 +1374,15 @@ def reconstruct(fragments: list[dict],
     if not seeded:
         print("  -- Could not seed any pair (mutual-rank or absolute). "
               "Returning identity placement.")
+        _write_assembly_artifacts(
+            fragments=fragments, transforms=transforms,
+            placed=placed, merge_log=merge_log, cache=cache,
+            recon_debug=recon_debug,
+            n_candidates=len(candidates),
+            n_ranked=len(ranked), n_mutual=len(mutual),
+            n_seeds=len(seeds),
+            status="no_seed_passed_attach_gate",
+        )
         _finalize_release_dinov2(fragments)
         return transforms
 
@@ -1576,42 +1599,100 @@ def reconstruct(fragments: list[dict],
                max(1, step) + 4, "final", recon_debug)
 
     # ── Logs and VRAM cleanup ───────────────────────────────────────────
-    with open(recon_debug / "merge_log.json", "w", encoding="utf-8") as fh:
-        json.dump(merge_log, fh, indent=2)
-    with open(recon_debug / "assembly_summary.json", "w", encoding="utf-8") as fh:
-        json.dump({
-            "n_fragments":          n,
-            "n_placed":             len(placed),
-            "n_candidate_pairs":    len(candidates),
-            "n_ranked_pairs":       len(ranked),
-            "n_mutual_pairs":       len(mutual),
-            "n_seed_candidates":    len(seeds),
-            "seed_fragment":        int(fragments[seed_id]["id"]),
-            "seed_source":          seed_source,
-            "seed_confidence":      round(float(conf0), 4),
-            "match_cache_calls":    cache.n_calls,
-            "match_cache_hits":     cache.n_hits,
-            "fragments_unplaced":   sorted(int(fragments[i]["id"])
-                                            for i in range(n) if i not in placed),
-        }, fh, indent=2)
-
-    # Compatibility artifact consumed by backend board endpoint and benchmarks.
-    final_translations = {}
-    for i in range(n):
-        fid = int(fragments[i].get("id", i))
-        T = transforms[i]
-        final_translations[str(fid)] = {
-            "dx": round(float(T[0, 2]), 2),
-            "dy": round(float(T[1, 2]), 2),
-            "placed": bool(i in placed),
-        }
-    with open(recon_debug / "final_translations.json", "w", encoding="utf-8") as fh:
-        json.dump(final_translations, fh, indent=2)
+    _write_assembly_artifacts(
+        fragments=fragments,
+        transforms=transforms,
+        placed=placed,
+        merge_log=merge_log,
+        cache=cache,
+        recon_debug=recon_debug,
+        n_candidates=len(candidates),
+        n_ranked=len(ranked),
+        n_mutual=len(mutual),
+        n_seeds=len(seeds),
+        seed_id=seed_id,
+        seed_source=seed_source,
+        seed_conf=conf0,
+    )
 
     _finalize_release_dinov2(fragments)
     print(f"\n  Assembly complete: {len(placed)}/{n} placed, "
           f"{cache.n_calls} matcher calls / {cache.n_hits} cache hits")
     return transforms
+
+
+def _write_assembly_artifacts(*,
+                               fragments: list[dict],
+                               transforms: dict[int, np.ndarray],
+                               placed: set[int],
+                               merge_log: list[dict],
+                               cache: "_MatchCache | None",
+                               recon_debug: Path,
+                               n_candidates: int = 0,
+                               n_ranked: int = 0,
+                               n_mutual: int = 0,
+                               n_seeds: int = 0,
+                               seed_id: int = -1,
+                               seed_source: str | None = None,
+                               seed_conf: float = 0.0,
+                               status: str | None = None) -> None:
+    """Persist the canonical assembly outputs.
+
+    Always writes:
+      * merge_log.json
+      * assembly_summary.json
+      * final_translations.json — {dx, dy, angle_deg, placed} per fragment
+      * final_transforms.json   — full 3x3 SE(2) affine per fragment
+
+    Called from every reconstruct() return path so downstream consumers
+    (composition, benchmark, backend) see a consistent artifact set even
+    when the MST couldn't seed.
+    """
+    n = len(fragments)
+    seed_fragment = (int(fragments[seed_id]["id"])
+                      if 0 <= seed_id < n else None)
+
+    with open(recon_debug / "merge_log.json", "w", encoding="utf-8") as fh:
+        json.dump(merge_log, fh, indent=2)
+    summary = {
+        "n_fragments":          n,
+        "n_placed":             len(placed),
+        "n_candidate_pairs":    int(n_candidates),
+        "n_ranked_pairs":       int(n_ranked),
+        "n_mutual_pairs":       int(n_mutual),
+        "n_seed_candidates":    int(n_seeds),
+        "seed_fragment":        seed_fragment,
+        "seed_source":          seed_source,
+        "seed_confidence":      round(float(seed_conf), 4),
+        "match_cache_calls":    int(cache.n_calls) if cache is not None else 0,
+        "match_cache_hits":     int(cache.n_hits)  if cache is not None else 0,
+        "fragments_unplaced":   sorted(int(fragments[i]["id"])
+                                        for i in range(n) if i not in placed),
+    }
+    if status is not None:
+        summary["status"] = status
+    with open(recon_debug / "assembly_summary.json", "w", encoding="utf-8") as fh:
+        json.dump(summary, fh, indent=2)
+
+    final_translations: dict[str, dict] = {}
+    final_transforms: dict[str, list[list[float]]] = {}
+    for i in range(n):
+        fid = int(fragments[i].get("id", i))
+        T = transforms[i]
+        angle_rad = float(np.arctan2(T[1, 0], T[0, 0]))
+        final_translations[str(fid)] = {
+            "dx":        round(float(T[0, 2]), 2),
+            "dy":        round(float(T[1, 2]), 2),
+            "angle_deg": round(float(np.degrees(angle_rad)), 3),
+            "placed":    bool(i in placed),
+        }
+        final_transforms[str(fid)] = [[round(float(T[r, c]), 6)
+                                        for c in range(3)]
+                                       for r in range(3)]
+    with open(recon_debug / "final_translations.json", "w", encoding="utf-8") as fh:
+        json.dump(final_translations, fh, indent=2)
+    with open(recon_debug / "final_transforms.json", "w", encoding="utf-8") as fh:
+        json.dump(final_transforms, fh, indent=2)
 
 
 def _finalize_release_dinov2(fragments: list[dict]) -> None:
