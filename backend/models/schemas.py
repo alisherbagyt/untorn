@@ -52,6 +52,8 @@ class DebugResponse(BaseModel):
     neighbors: Optional[List[Dict[str, Any]]] = None
     steps: Optional[List[Dict[str, Any]]] = None
     translations: Optional[Dict[str, Any]] = None
+    transforms: Optional[Dict[str, Any]] = None
+    assembly_summary: Optional[Dict[str, Any]] = None
     composition: Optional[Dict[str, Any]] = None
     inpainting: Optional[Dict[str, Any]] = None
     paths: Optional[Dict[str, Any]] = None

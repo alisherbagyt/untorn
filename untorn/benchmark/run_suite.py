@@ -40,19 +40,39 @@ def _load_predicted_transforms(pipeline_debug_dir: Path) -> dict:
     """
     Reconstruct 3x3 affines per fragment from the pipeline's debug output.
 
-    The pipeline writes `reconstruction/final_translations.json` with
-    angle_deg, dx, dy per fragment id. That's enough to rebuild the
-    3x3 affine that maps input pixel coords to canvas coords.
+    Prefers `reconstruction/final_transforms.json` (canonical 3x3 affine
+    per fragment, written verbatim by ``assembly.reconstruct``). Falls
+    back to `reconstruction/final_translations.json` (angle_deg + dx + dy
+    summary) for backwards compatibility with older debug dirs and for
+    runs where only the summary is present.
     """
+    transforms_path = pipeline_debug_dir / "reconstruction" / "final_transforms.json"
+    if transforms_path.exists():
+        try:
+            data = json.loads(transforms_path.read_text(encoding="utf-8"))
+        except Exception:
+            data = None
+        if isinstance(data, dict) and data:
+            out: dict[int, np.ndarray] = {}
+            for fid_str, M_list in data.items():
+                try:
+                    M = np.asarray(M_list, dtype=np.float64)
+                except Exception:
+                    continue
+                if M.shape == (3, 3):
+                    out[int(fid_str)] = M
+            if out:
+                return out
+
     p = pipeline_debug_dir / "reconstruction" / "final_translations.json"
     if not p.exists():
         return {}
     data = json.loads(p.read_text(encoding="utf-8"))
     out = {}
     for fid_str, rec in data.items():
-        ang = np.deg2rad(rec["angle_deg"])
-        dx = rec["dx"]
-        dy = rec["dy"]
+        ang = np.deg2rad(float(rec.get("angle_deg", 0.0)))
+        dx = float(rec.get("dx", 0.0))
+        dy = float(rec.get("dy", 0.0))
         M = np.array([
             [np.cos(ang), -np.sin(ang), dx],
             [np.sin(ang),  np.cos(ang), dy],
