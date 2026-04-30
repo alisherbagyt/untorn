@@ -783,7 +783,7 @@ export function AssemblyView({ jobId }: AssemblyViewProps) {
             <RotateCcw size={14} />
             <span className="hidden sm:inline">Сброс</span>
           </Button>
-          <Button variant="outline" size="sm" onClick={fitToView} title="Fit to view">
+          <Button variant="outline" size="sm" onClick={() => fitToView()} title="Fit to view">
             <Maximize size={14} />
             <span className="hidden sm:inline">Вписать</span>
           </Button>
