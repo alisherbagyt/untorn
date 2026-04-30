@@ -203,20 +203,20 @@ def _seed_id_from_predicted(predicted: dict[int, np.ndarray]) -> int | None:
 @dataclass(frozen=True)
 class Variant:
     label: str
-    grid_filter: bool
     siamese: bool
 
 
+# Engine-rebuild April 2026: the LBP grid_filter module was removed because
+# it dropped real adjacencies more often than it accelerated matching at
+# the working scale (<=40 fragments). The benchmark now varies only the
+# Siamese edge-matcher gate.
 VARIANTS = {
-    "A": Variant("baseline",     grid_filter=False, siamese=False),
-    "B": Variant("grid_only",    grid_filter=True,  siamese=False),
-    "C": Variant("siamese_only", grid_filter=False, siamese=True),
-    "D": Variant("hybrid",       grid_filter=True,  siamese=True),
+    "A": Variant("baseline",     siamese=False),
+    "B": Variant("siamese",      siamese=True),
 }
 
 
 def _set_variant(v: Variant) -> None:
-    cfg.GRID_FILTER_ENABLED  = bool(v.grid_filter)
     cfg.EDGE_MATCHER_ENABLED = bool(v.siamese)
 
 
@@ -415,7 +415,7 @@ def main() -> None:
         for v_key in requested:
             variant = VARIANTS[v_key]
             print(f"\n[bench] === variant {v_key}: {variant.label} "
-                  f"(grid={variant.grid_filter}, siamese={variant.siamese}) ===")
+                  f"(siamese={variant.siamese}) ===")
             per_doc: list[dict] = []
             for d_idx, entry in enumerate(chosen_docs):
                 doc_id = entry["doc_id"]
